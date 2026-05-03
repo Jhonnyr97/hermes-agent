@@ -50,6 +50,13 @@ if [ "$(id -u)" = "0" ]; then
         chmod 640 "$HERMES_HOME/config.yaml" 2>/dev/null || true
     fi
 
+    # Ensure skills directory is writable for atomic skill_manage operations.
+    # The image build may create /opt/data/skills as root, and the bulk chown
+    # above skips when the top-level volume is already hermes-owned.
+    if [ -d "$HERMES_HOME/skills" ]; then
+        chown -R hermes:hermes "$HERMES_HOME"/skills 2>/dev/null || true
+    fi
+
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"
 fi

@@ -7,9 +7,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent as an available model
-- GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
-- GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/stop    — interrupt a running agent
 - GET  /health                     — health check
@@ -28,12 +26,16 @@ import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import socket as _socket
 import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 from typing import Any, Dict, List, Optional
 
 try:
@@ -127,6 +129,91 @@ def _normalize_chat_content(
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
 _FILE_PART_TYPES = frozenset({"file", "input_file"})
+_FILE_URL_PART_TYPES = frozenset({"file_url", "input_file_url"})
+_FILE_PATH_PART_TYPES = frozenset({"file_path"})
+_SHARED_UPLOADS_DIR = Path(os.environ.get("SHARED_UPLOADS_DIR", "/mnt/shared-uploads"))
+_FILE_URL_DOWNLOAD_DIR = Path(os.environ.get("FILE_URL_DOWNLOAD_DIR", "/tmp/hermes-file-urls"))
+_ALLOWED_FILE_URL_HOSTS = {
+    host.strip().lower()
+    for host in os.environ.get("ALLOWED_FILE_URL_HOSTS", "hermes-ui,localhost,127.0.0.1").split(",")
+    if host.strip()
+}
+_MAX_FILE_READ_BYTES = 100 * 1024 * 1024  # 100 MB max preview
+
+
+def _safe_download_filename(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name or "file").strip("._")
+    return safe[:160] or "file"
+
+
+def _read_file_part_summary(file_path: str, original_name: str, content_type: str) -> Dict[str, str]:
+    if not os.path.isfile(file_path):
+        return {
+            "type": "text",
+            "text": f"\n[File: {original_name} — not found at {file_path}]\n"
+        }
+
+    try:
+        file_size = os.path.getsize(file_path)
+        if file_size > _MAX_FILE_READ_BYTES:
+            return {
+                "type": "text",
+                "text": f"\n[File: {original_name} ({content_type}) — {file_size} bytes, exceeds preview limit]\nFile path: {file_path}"
+            }
+
+        with open(file_path, "rb") as f:
+            raw = f.read()
+
+        try:
+            text = raw.decode("utf-8")
+            preview = text[:MAX_NORMALIZED_TEXT_LENGTH]
+            return {
+                "type": "text",
+                "text": f"\n[File: {original_name} ({content_type})]\n{preview}"
+            }
+        except UnicodeDecodeError:
+            return {
+                "type": "text",
+                "text": f"\n[File: {original_name} ({content_type}) — binary file, {file_size} bytes]\nFile path: {file_path}"
+            }
+    except Exception as e:
+        return {
+            "type": "text",
+            "text": f"\n[File: {original_name} — error reading: {e}]\n"
+        }
+
+
+def _download_file_url(file_url: str, original_name: str, expected_size: int | None = None) -> str:
+    parsed = urlparse(file_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("invalid_file_url:File URLs must use http or https.")
+
+    host = (parsed.hostname or "").lower()
+    if host not in _ALLOWED_FILE_URL_HOSTS:
+        raise ValueError(f"invalid_file_url:File URL host {host!r} is not allowed.")
+
+    _FILE_URL_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    destination = _FILE_URL_DOWNLOAD_DIR / f"{uuid.uuid4().hex}_{_safe_download_filename(original_name)}"
+    request = Request(file_url, headers={"User-Agent": "HermesFileFetcher/1.0"})
+    downloaded = 0
+
+    with urlopen(request, timeout=20) as response, open(destination, "wb") as output:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            downloaded += len(chunk)
+            if downloaded > _MAX_FILE_READ_BYTES:
+                output.close()
+                destination.unlink(missing_ok=True)
+                raise ValueError("file_too_large:File exceeds download limit.")
+            output.write(chunk)
+
+    if expected_size is not None and expected_size >= 0 and downloaded != expected_size:
+        destination.unlink(missing_ok=True)
+        raise ValueError("invalid_file_url:Downloaded file size did not match metadata.")
+
+    return str(destination)
 
 
 def _normalize_multimodal_content(content: Any) -> Any:
@@ -228,11 +315,63 @@ def _normalize_multimodal_content(content: Any) -> Any:
                 "but uploaded files and document inputs are not supported on this endpoint."
             )
 
+        if part_type in _FILE_URL_PART_TYPES:
+            file_info = part.get("file_url", {})
+            if not isinstance(file_info, dict):
+                raise ValueError("invalid_content_part:file_url must be an object.")
+
+            url_value = file_info.get("url", "")
+            original_name = str(file_info.get("original_name") or "file")
+            content_type = str(file_info.get("content_type") or "")
+            byte_size = file_info.get("byte_size")
+            expected_size = int(byte_size) if isinstance(byte_size, int) and byte_size >= 0 else None
+            if not isinstance(url_value, str) or not url_value.strip():
+                raise ValueError("invalid_file_url:File URL parts must include a non-empty URL.")
+
+            text_accum_len += 1
+            try:
+                file_path = _download_file_url(url_value.strip(), original_name, expected_size)
+                normalized_parts.append(_read_file_part_summary(file_path, original_name, content_type))
+            except ValueError:
+                raise
+            except Exception as e:
+                normalized_parts.append({
+                    "type": "text",
+                    "text": f"\n[File: {original_name} — download failed: {e}]\n"
+                })
+            continue
+
+        if part_type in _FILE_PATH_PART_TYPES:
+            file_info = part.get("file_path", {})
+            raw_path = file_info.get("path", "")
+            original_name = file_info.get("original_name", "file")
+            content_type = file_info.get("content_type", "")
+            text_accum_len += 1
+            if raw_path:
+                # Sandbox: resolve path and ensure it's under SHARED_UPLOADS_DIR
+                try:
+                    resolved = Path(raw_path).resolve()
+                    resolved.relative_to(_SHARED_UPLOADS_DIR.resolve())
+                except (ValueError, RuntimeError):
+                    normalized_parts.append({
+                        "type": "text",
+                        "text": f"\n[File: {original_name} — path outside allowed directory]\n"
+                    })
+                    continue
+                file_path = str(resolved)
+                normalized_parts.append(_read_file_part_summary(file_path, original_name, content_type))
+            else:
+                normalized_parts.append({
+                    "type": "text",
+                    "text": f"\n[File: {original_name} — no path provided]\n"
+                })
+            continue
+
         # Unknown part type — reject explicitly so clients get a clear error
         # instead of a silently dropped turn.
         raise ValueError(
             f"unsupported_content_type:Unsupported content part type {raw_type!r}. "
-            "Only text and image_url/input_image parts are supported."
+            "Only text, image_url/input_image, and file_url parts are supported."
         )
 
     if not normalized_parts:
@@ -258,6 +397,8 @@ def _content_has_visible_payload(content: Any) -> bool:
                 if ptype in _TEXT_PART_TYPES and str(part.get("text") or "").strip():
                     return True
                 if ptype in _IMAGE_PART_TYPES:
+                    return True
+                if ptype in _FILE_URL_PART_TYPES or ptype in _FILE_PATH_PART_TYPES:
                     return True
     return False
 
@@ -592,10 +733,20 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
-        # Pollable run status for dashboards and external control-plane UIs.
-        self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        # Approval session keys indexed by run_id for POST /v1/runs/{run_id}/approvals/{id}
+        self._run_approval_session_keys: Dict[str, str] = {}
+        # Approval IDs indexed by (run_id, id_str) for lookup
+        self._run_approval_ids: Dict[tuple[str, str], str] = {}
+        # Approval UUID -> session_key mapping for resolve_gateway_approval
+        self._approval_session_map: Dict[str, str] = {}
+        # Timeout timer handles keyed by (run_id, approval_id) for auto-expire
+        self._approval_timeout_handles: Dict[tuple[str, str], "asyncio.TimerHandle"] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
-
+        # Generated files storage — AI writes to /tmp/ by default via write_file
+        self._generated_files_dir: str = extra.get(
+            "generated_files_dir",
+            os.getenv("HERMES_GENERATED_FILES_DIR", "/tmp"),
+        )
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
         """Normalize configured CORS origins into a stable tuple."""
@@ -717,6 +868,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -757,6 +909,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            reasoning_callback=reasoning_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
         )
@@ -791,6 +944,187 @@ class APIServerAdapter(BasePlatformAdapter):
             "pid": os.getpid(),
         })
 
+    # ------------------------------------------------------------------
+    # Generated file delivery — path-based media endpoint
+    # ------------------------------------------------------------------
+
+    async def _handle_file_media(self, request: "web.Request") -> "web.Response":
+        """GET /v1/files/media -- serve a generated file by path.
+
+        Query parameters:
+          path (str) -- absolute path to file under generated files dir
+
+        Validates the path is within the allowed directory tree, blocks
+        path traversal, and enforces a 100 MB size limit. Uses the same
+        API key auth as chat completions.
+        """
+        # Authenticate — same API key as chat completions
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        file_path = request.query.get("path", "")
+        if not file_path:
+            return web.json_response({"error": "Missing path parameter"}, status=400)
+
+        # Resolve and validate path
+        try:
+            resolved = Path(file_path).resolve()
+            allowed = Path(self._generated_files_dir).resolve()
+            resolved.relative_to(allowed)
+        except (ValueError, RuntimeError):
+            return web.json_response({"error": "Access denied"}, status=403)
+
+        if not resolved.exists() or not resolved.is_file():
+            return web.json_response({"error": "File not found"}, status=404)
+
+        # Size limit
+        max_bytes = 100 * 1024 * 1024
+        if resolved.stat().st_size > max_bytes:
+            return web.json_response({"error": "File too large"}, status=413)
+
+        # Content type from extension
+        ext = resolved.suffix.lower()
+        content_type_map = {
+            ".csv": "text/csv",
+            ".txt": "text/plain",
+            ".md": "text/markdown",
+            ".json": "application/json",
+            ".pdf": "application/pdf",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".gif": "image/gif",
+            ".svg": "image/svg+xml",
+            ".html": "text/html",
+            ".zip": "application/zip",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        }
+        content_type = content_type_map.get(ext, "application/octet-stream")
+
+        try:
+            resp = web.FileResponse(resolved)
+            resp.headers["Content-Disposition"] = f'attachment; filename="{resolved.name}"'
+            resp.headers["Content-Type"] = content_type
+            resp.headers["X-Content-Type-Options"] = "nosniff"
+            return resp
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    def _artifact_created_event(self, run_id: str, path: str) -> Optional[Dict[str, Any]]:
+        """Build an artifact.created event for a validated generated file."""
+        try:
+            resolved = Path(path).resolve()
+            allowed = Path(self._generated_files_dir).resolve()
+            resolved.relative_to(allowed)
+        except (ValueError, RuntimeError):
+            logger.warning("[artifact.created] path %s outside allowed dir", path)
+            return None
+
+        if not resolved.exists() or not resolved.is_file():
+            logger.warning("[artifact.created] file not found: %s", resolved)
+            return None
+
+        stat = resolved.stat()
+        if stat.st_size <= 0 or stat.st_size > 100 * 1024 * 1024:
+            logger.warning("[artifact.created] invalid size for %s: %d", resolved, stat.st_size)
+            return None
+
+        content_type, _ = mimetypes.guess_type(resolved.name)
+        return {
+            "event": "artifact.created",
+            "run_id": run_id,
+            "timestamp": time.time(),
+            "path": str(resolved),
+            "filename": resolved.name,
+            "content_type": content_type or "application/octet-stream",
+            "byte_size": stat.st_size,
+        }
+
+    def _emit_attach_file_artifact(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        function_args: Any,
+        function_result: Any,
+    ) -> None:
+        """Translate a successful attach_file tool completion into an artifact event."""
+        path = ""
+        if isinstance(function_args, dict):
+            path = str(function_args.get("path") or "")
+
+        try:
+            result = json.loads(function_result) if isinstance(function_result, str) else function_result
+        except (TypeError, json.JSONDecodeError):
+            result = {}
+
+        if isinstance(result, dict):
+            if result.get("error"):
+                logger.warning("[artifact.created] attach_file failed: %s", result.get("error"))
+                return
+            path = str(result.get("path") or path)
+
+        if not path:
+            logger.warning("[artifact.created] attach_file missing path")
+            return
+
+        event = self._artifact_created_event(run_id, path)
+        if not event:
+            return
+
+        q = self._run_streams.get(run_id)
+        if q is None:
+            return
+
+        try:
+            loop.call_soon_threadsafe(q.put_nowait, event)
+            logger.info(
+                "[artifact.created] run=%s path=%s size=%d type=%s",
+                run_id, event["path"], event["byte_size"], event["content_type"],
+            )
+        except Exception:
+            pass
+
+
+    async def _handle_serve_file(self, request: "web.Request") -> "web.Response":
+        """Serve a file from the shared uploads directory.
+        
+        Uses signed URLs (HMAC + expiration) instead of Bearer auth so
+        that browser clicks work without manual headers.
+        """
+        filename = request.match_info.get("filename", "")
+        expires = request.query.get("expires", "")
+        sig = request.query.get("sig", "")
+        if not filename or not expires or not sig:
+            return web.json_response({"error": "Missing signature params"}, status=401)
+        if ".." in filename or "/" in filename:
+            return web.json_response({"error": "Invalid filename"}, status=400)
+        try:
+            exp_int = int(expires)
+            if time.time() > exp_int:
+                return web.json_response({"error": "Link expired"}, status=401)
+        except ValueError:
+            return web.json_response({"error": "Invalid expiration"}, status=400)
+        # Verify signature
+        expected_sig = hmac.new(self._api_key.encode(), f"{filename}:{expires}".encode(), hashlib.sha256).hexdigest()[:16]
+        if not hmac.compare_digest(expected_sig, sig):
+            return web.json_response({"error": "Invalid signature"}, status=403)
+        file_path = _SHARED_UPLOADS_DIR / filename
+        try:
+            file_path = file_path.resolve()
+            file_path.relative_to(_SHARED_UPLOADS_DIR.resolve())
+        except (ValueError, RuntimeError):
+            return web.json_response({"error": "Access denied"}, status=403)
+        if not file_path.exists() or not file_path.is_file():
+            return web.json_response({"error": "File not found"}, status=404)
+        try:
+            return web.FileResponse(file_path)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
         auth_err = self._check_auth(request)
@@ -812,50 +1146,124 @@ class APIServerAdapter(BasePlatformAdapter):
             ],
         })
 
-    async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
-        """GET /v1/capabilities — advertise the stable API surface.
+    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id} — read-only session metadata and messages.
 
-        External UIs and orchestrators use this endpoint to discover the API
-        server's plugin-safe contract without scraping docs or assuming that
-        every Hermes version exposes the same endpoints.
+        Query params:
+          resolved=true|false        default true  — follow parent→child chain
+          include=messages           default       — return messages
+          include=messages,tool_calls,reasoning    — return with extras
+          format=raw|conversation    default raw   — raw export or conversation format
         """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
-        return web.json_response({
-            "object": "hermes.api_server.capabilities",
-            "platform": "hermes-agent",
-            "model": self._model_name,
-            "auth": {
-                "type": "bearer",
-                "required": bool(self._api_key),
-            },
-            "features": {
-                "chat_completions": True,
-                "chat_completions_streaming": True,
-                "responses_api": True,
-                "responses_streaming": True,
-                "run_submission": True,
-                "run_status": True,
-                "run_events_sse": True,
-                "run_stop": True,
-                "tool_progress_events": True,
-                "session_continuity_header": "X-Hermes-Session-Id",
-                "cors": bool(self._cors_origins),
-            },
-            "endpoints": {
-                "health": {"method": "GET", "path": "/health"},
-                "health_detailed": {"method": "GET", "path": "/health/detailed"},
-                "models": {"method": "GET", "path": "/v1/models"},
-                "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
-                "responses": {"method": "POST", "path": "/v1/responses"},
-                "runs": {"method": "POST", "path": "/v1/runs"},
-                "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
-                "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
-                "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
-            },
-        })
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response(
+                _openai_error("Missing session_id"),
+                status=400,
+            )
+        # Sanitize: reject control characters
+        if re.search(r'[\r\n\x00]', session_id):
+            return web.json_response(
+                _openai_error("Invalid session ID"),
+                status=400,
+            )
+
+        resolved = request.query.get("resolved", "true").lower() == "true"
+        include_param = request.query.get("include", "messages")
+        format_param = request.query.get("format", "raw")
+
+        include_set = {s.strip() for s in include_param.split(",") if s.strip()}
+
+        try:
+            db = self._ensure_session_db()
+            if db is None:
+                return web.json_response(
+                    _openai_error("Session storage not available"),
+                    status=503,
+                )
+
+            resolved_session_id = session_id
+            if resolved:
+                # Use get_compression_tip to resolve to the active continuation
+                # after compression, not the stale root with old messages.
+                if hasattr(db, "get_compression_tip"):
+                    tip = db.get_compression_tip(session_id)
+                    if tip:
+                        resolved_session_id = tip
+                elif hasattr(db, "resolve_resume_session_id"):
+                    resolved_session_id = db.resolve_resume_session_id(session_id)
+
+            # Get session metadata
+            session_data = db.get_session(resolved_session_id)
+            if not session_data:
+                return web.json_response(
+                    _openai_error(f"Session not found: {session_id}"),
+                    status=404,
+                )
+
+            # Build response
+            compressed = resolved_session_id != session_id
+            lineage = [session_id]
+            if resolved_session_id != session_id:
+                lineage = [session_id, resolved_session_id]
+
+            # Determine if we have a compressed session by checking lineage length
+            # (a compressed session has a child in the parent→child chain)
+            if hasattr(db, "_session_lineage_root_to_tip"):
+                try:
+                    full_lineage = db._session_lineage_root_to_tip(resolved_session_id)
+                    if len(full_lineage) > 1:
+                        compressed = True
+                        lineage = full_lineage
+                except Exception:
+                    pass
+
+            response_data: Dict[str, Any] = {
+                "id": session_id,
+                "resolved_session_id": resolved_session_id,
+                "compressed": compressed,
+                "lineage": lineage,
+                "message_count": session_data.get("message_count", 0),
+                "tool_call_count": session_data.get("tool_call_count", 0),
+            }
+
+            # Include messages if requested
+            if "messages" in include_set or not include_set - {"messages", "tool_calls", "reasoning"}:
+                if format_param == "conversation":
+                    messages = db.get_messages_as_conversation(
+                        resolved_session_id,
+                        include_ancestors=True,
+                    )
+                else:
+                    export = db.export_session(resolved_session_id)
+                    messages = export.get("messages", []) if export else []
+
+                if not include_set.issuperset({"tool_calls"}):
+                    # Strip tool_calls from messages if not requested
+                    messages = [
+                        {k: v for k, v in msg.items() if k != "tool_calls"}
+                        for msg in messages
+                    ]
+                if "reasoning" not in include_set:
+                    messages = [
+                        {k: v for k, v in msg.items() if k not in ("reasoning", "reasoning_content", "reasoning_details")}
+                        for msg in messages
+                    ]
+
+                response_data["messages"] = messages
+
+            return web.json_response(response_data)
+
+        except Exception as e:
+            logger.warning("Failed to fetch session %s: %s", session_id, e)
+            return web.json_response(
+                _openai_error(f"Internal error: {e}"),
+                status=500,
+            )
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -981,62 +1389,39 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
-            # Track which tool_call_ids we've emitted a "running" lifecycle
-            # event for, so a "completed" event without a matching "running"
-            # (e.g. internal/filtered tools) is silently dropped instead of
-            # producing an orphaned event clients can't correlate.
-            _started_tool_call_ids: set[str] = set()
+            def _on_tool_progress(event_type, name, preview, args, **kwargs):
+                """Send tool progress as a separate SSE event.
 
-            def _on_tool_start(tool_call_id, function_name, function_args):
-                """Emit ``hermes.tool.progress`` with ``status: running``.
+                Previously, progress markers like ``⏰ list`` were injected
+                directly into ``delta.content``.  OpenAI-compatible frontends
+                (Open WebUI, LobeChat, …) store ``delta.content`` verbatim as
+                the assistant message and send it back on subsequent requests.
+                After enough turns the model learns to *emit* the markers as
+                plain text instead of issuing real tool calls — silently
+                hallucinating tool results.  See #6972.
 
-                Replaces the old ``tool_progress_callback("tool.started",
-                ...)`` emit so SSE consumers receive a single event per
-                tool start, carrying both the legacy ``tool``/``emoji``/
-                ``label`` payload (for #6972 frontends) and the new
-                ``toolCallId``/``status`` correlation fields (#16588).
-
-                Skips tools whose names start with ``_`` so internal
-                events (``_thinking``, …) stay off the wire — matching
-                the prior ``_on_tool_progress`` filter exactly.
+                The fix: push a tagged tuple ``("__tool_progress__", payload)``
+                onto the stream queue.  The SSE writer emits it as a custom
+                ``event: hermes.tool.progress`` line that compliant frontends
+                can render for UX but will *not* persist into conversation
+                history.  Clients that don't understand the custom event type
+                silently ignore it per the SSE specification.
                 """
-                if not tool_call_id or function_name.startswith("_"):
+                if event_type != "tool.started":
                     return
-                _started_tool_call_ids.add(tool_call_id)
-                from agent.display import build_tool_preview, get_tool_emoji
-                label = build_tool_preview(function_name, function_args) or function_name
+                if name.startswith("_"):
+                    return
+                from agent.display import get_tool_emoji
+                emoji = get_tool_emoji(name)
+                label = preview or name
                 _stream_q.put(("__tool_progress__", {
-                    "tool": function_name,
-                    "emoji": get_tool_emoji(function_name),
+                    "tool": name,
+                    "emoji": emoji,
                     "label": label,
-                    "toolCallId": tool_call_id,
-                    "status": "running",
-                }))
-
-            def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
-                """Emit the matching ``status: completed`` event.
-
-                Dropped if the start was filtered (internal tool, missing
-                id, or never seen) so clients never get an orphaned
-                ``completed`` they can't correlate to a prior ``running``.
-                """
-                if not tool_call_id or tool_call_id not in _started_tool_call_ids:
-                    return
-                _started_tool_call_ids.discard(tool_call_id)
-                _stream_q.put(("__tool_progress__", {
-                    "tool": function_name,
-                    "toolCallId": tool_call_id,
-                    "status": "completed",
                 }))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
-            #
-            # ``tool_progress_callback`` is intentionally not wired here:
-            # it would duplicate every emit because ``run_agent`` fires it
-            # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
-            # The structured callbacks are strictly richer (they carry the
-            # tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -1044,8 +1429,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
-                tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete,
+                tool_progress_callback=_on_tool_progress,
                 agent_ref=agent_ref,
             ))
 
@@ -1088,6 +1472,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if not final_response:
             final_response = result.get("error", "(No response generated)")
 
+        # Pass FILE_REF markers through as-is — Open WebUI middleware
+        # converts them to authenticated artifact download links.
+        # Supported format: [FILE_REF:uuid:filename]
         response_data = {
             "id": completion_id,
             "object": "chat.completion",
@@ -1160,19 +1547,33 @@ class APIServerAdapter(BasePlatformAdapter):
                 Tagged tuples ``("__tool_progress__", payload)`` are sent
                 as a custom ``event: hermes.tool.progress`` SSE event so
                 frontends can display them without storing the markers in
-                conversation history.  See #6972 for the original event,
-                #16588 for the ``toolCallId``/``status`` lifecycle fields.
+                conversation history.  See #6972.
+
+                Dicts with an ``"event"`` key are sent as custom SSE events
+                with the event type taken from the key (e.g. ``artifact.created``)
+                and the remaining keys serialized as the event data payload.
+                This lets downstream consumers (Rails HermesRunJob, etc.)
+                dispatch on event type without parsing delta.content.
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, dict) and "event" in item:
+                    event_name = item["event"]
+                    event_data = {k: v for k, v in item.items() if k != "event"}
+                    await response.write(
+                        f"event: {event_name}\ndata: {json.dumps(event_data)}\n\n".encode()
+                    )
                 else:
+                    # Pass FILE_REF markers through as-is — Open WebUI
+                    # middleware converts them to authenticated links.
+                    content_text = item
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"content": content_text}, "finish_reason": None}],
                     }
                     await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 return time.monotonic()
@@ -1623,6 +2024,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
+            # Pass FILE_REF markers through as-is — Open WebUI middleware
+            # converts them to authenticated artifact download links.
             if message_opened:
                 await _write_event("response.output_text.done", {
                     "type": "response.output_text.done",
@@ -2351,11 +2754,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
-            effective_task_id = session_id or str(uuid.uuid4())
             result = agent.run_conversation(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                task_id=effective_task_id,
+                task_id="default",
             )
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -2372,31 +2774,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _MAX_CONCURRENT_RUNS = 10  # Prevent unbounded resource allocation
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
-    _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
-
-    def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
-        """Update pollable run status without exposing private agent objects."""
-        now = time.time()
-        current = self._run_statuses.get(run_id, {})
-        current.update({
-            "object": "hermes.run",
-            "run_id": run_id,
-            "status": status,
-            "updated_at": now,
-        })
-        current.setdefault("created_at", fields.pop("created_at", now))
-        current.update(fields)
-        self._run_statuses[run_id] = current
-        return current
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
-            self._set_run_status(
-                run_id,
-                self._run_statuses.get(run_id, {}).get("status", "running"),
-                last_event=event.get("event"),
-            )
             q = self._run_streams.get(run_id)
             if q is None:
                 return
@@ -2431,6 +2812,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "text": preview or "",
                 })
+            elif event_type == "approval.requested":
+                # Forward approval requests from tools/approval.py to the SSE stream
+                approval_data = kwargs.get("approval_data", {}) or {}
+                _timeout = approval_data.get("timeout", 300)
+                _push({
+                    "event": "approval.requested",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "requested_at": ts,
+                    "expires_at": ts + _timeout,
+                    "approval_id": approval_data.get("id", ""),
+                    "command": approval_data.get("command", ""),
+                    "description": approval_data.get("description", ""),
+                    "choices": approval_data.get("choices", ["once", "session", "always", "deny"]),
+                    "timeout": _timeout,
+                })
             # _thinking and subagent_progress are intentionally not forwarded
 
         return _callback
@@ -2457,16 +2854,61 @@ class APIServerAdapter(BasePlatformAdapter):
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
-        user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
-        if not user_message:
-            return web.json_response(_openai_error("No user message found in input"), status=400)
+        # Normalize input to message list (same as _handle_responses)
+        input_messages: List[Dict[str, Any]] = []
+        if isinstance(raw_input, str):
+            input_messages = [{"role": "user", "content": raw_input}]
+        elif isinstance(raw_input, list):
+            for idx, item in enumerate(raw_input):
+                if isinstance(item, str):
+                    input_messages.append({"role": "user", "content": item})
+                elif isinstance(item, dict):
+                    role = item.get("role", "user")
+                    try:
+                        content = _normalize_multimodal_content(item.get("content", ""))
+                    except ValueError as exc:
+                        return _multimodal_validation_error(exc, param=f"input[{idx}].content")
+                    input_messages.append({"role": role, "content": content})
+        else:
+            return web.json_response(_openai_error("'input' must be a string or array"), status=400)
+
+        # Use the last message as user_message
+        user_message = input_messages[-1]["content"]
+        # Validate with _content_has_visible_payload (supports lists)
+        if not _content_has_visible_payload(user_message):
+            return web.json_response(
+                _openai_error("No user message found in input"),
+                status=400,
+            )
+
+        run_id = f"run_{uuid.uuid4().hex}"
+        loop = asyncio.get_running_loop()
+        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+        self._run_streams[run_id] = q
+        self._run_streams_created[run_id] = time.time()
+
+        event_cb = self._make_run_event_callback(run_id, loop)
+
+        # Also wire stream_delta_callback so message.delta events flow through
+        def _text_cb(delta: Optional[str]) -> None:
+            if delta is None:
+                return
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "event": "message.delta",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "delta": delta,
+                })
+            except Exception:
+                pass
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
-        conversation_history: List[Dict[str, str]] = []
+        conversation_history: List[Dict[str, Any]] = []
         raw_history = body.get("conversation_history")
         if raw_history:
             if not isinstance(raw_history, list):
@@ -2480,7 +2922,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
                         status=400,
                     )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+                try:
+                    entry_content = _normalize_multimodal_content(entry["content"])
+                except ValueError as exc:
+                    return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
+                conversation_history.append({"role": str(entry["role"]), "content": entry_content})
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
@@ -2496,68 +2942,154 @@ class APIServerAdapter(BasePlatformAdapter):
         # When input is a multi-message array, extract all but the last
         # message as conversation history (the last becomes user_message).
         # Only fires when no explicit history was provided.
-        if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
-            for msg in raw_input[:-1]:
-                if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
-                    content = msg["content"]
-                    if isinstance(content, list):
-                        # Flatten multi-part content blocks to text
-                        content = " ".join(
-                            part.get("text", "") for part in content
-                            if isinstance(part, dict) and part.get("type") == "text"
-                        )
-                    conversation_history.append({"role": msg["role"], "content": str(content)})
+        if not conversation_history and len(input_messages) > 1:
+            conversation_history = [
+                {"role": msg["role"], "content": msg["content"]}
+                for msg in input_messages[:-1]
+            ]
 
-        run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
-        ephemeral_system_prompt = instructions
-        loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
-        created_at = time.time()
-        self._run_streams[run_id] = q
-        self._run_streams_created[run_id] = created_at
+        resolved_session_id = session_id  # default: same as requested
 
-        event_cb = self._make_run_event_callback(run_id, loop)
-
-        # Also wire stream_delta_callback so message.delta events flow through.
-        def _text_cb(delta: Optional[str]) -> None:
-            if delta is None:
-                return
+        # === FALLBACK: load history from SessionDB by session_id ===
+        # Priority: explicit conversation_history > previous_response_id >
+        #            persisted Hermes session by session_id > empty history
+        if not conversation_history and session_id:
             try:
-                loop.call_soon_threadsafe(q.put_nowait, {
-                    "event": "message.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
-            except Exception:
-                pass
+                db = self._ensure_session_db()
+                if db is not None:
+                    # Resolve the session ID: use get_compression_tip to find the
+                    # active continuation after compression, so the agent executes
+                    # on the tip session (where new messages are persisted), not
+                    # on a stale root session with old messages only.
+                    if hasattr(db, "get_compression_tip"):
+                        tip = db.get_compression_tip(session_id)
+                        if tip:
+                            resolved_session_id = tip
+                    elif hasattr(db, "resolve_resume_session_id"):
+                        resolved_session_id = db.resolve_resume_session_id(session_id)
+                    loaded = db.get_messages_as_conversation(
+                        resolved_session_id,
+                        include_ancestors=True,
+                    )
+                    if loaded:
+                        logger.info(
+                            "Loaded %d history messages from session %s (resolved: %s)",
+                            len(loaded), session_id, resolved_session_id,
+                        )
+                        conversation_history = loaded
+            except Exception as e:
+                logger.debug("Failed to load session history for %s: %s", session_id, e)
+                # Fall through with empty history — never block a run on DB failure
 
-        self._set_run_status(
-            run_id,
-            "queued",
-            created_at=created_at,
-            session_id=session_id,
-            model=body.get("model", self._model_name),
-        )
+        # Use resolved session (compression tip) as the execution session
+        # so that new messages are persisted on the active continuation,
+        # not on a stale root session.
+        execution_session_id = resolved_session_id
+        ephemeral_system_prompt = instructions
+
+        def _tool_complete_cb(tool_call_id, function_name, function_args, function_result):
+            if function_name == "attach_file":
+                self._emit_attach_file_artifact(run_id, loop, function_args, function_result)
 
         async def _run_and_close():
+            _api_approval_session_key = f"api-run-{run_id}"
+            _approval_notified = False
+            _current_approval_id = None
+
+            def _approval_notify_sync(approval_data: dict) -> None:
+                """Bridge sync->async: push approval.requested to the SSE queue.
+                Runs inside the agent thread (run_in_executor), so we thread-safe
+                the queue push via call_soon_threadsafe."""
+                nonlocal _approval_notified, _current_approval_id
+                _approval_notified = True
+                import uuid as _uuid
+                approval_id = _uuid.uuid4().hex
+                _current_approval_id = approval_id
+                # Store mapping so the HTTP endpoint can resolve it
+                self._run_approval_session_keys[run_id] = _api_approval_session_key
+                self._run_approval_ids[(run_id, approval_id)] = _api_approval_session_key
+                self._approval_session_map[approval_id] = _api_approval_session_key
+
+                # Create enriched approval data with ID and push via event_cb
+                enriched = dict(approval_data)
+                enriched["id"] = approval_id
+                enriched["choices"] = ["once", "session", "always", "deny"]
+                try:
+                    from tools.approval import _get_approval_config
+                    enriched["timeout"] = _get_approval_config().get("gateway_timeout", 300)
+                except Exception:
+                    enriched["timeout"] = 300
+                event_cb(
+                    "approval.requested", "_approval", "",
+                    approval_data=enriched,
+                )
+
+                # Schedule auto-expire timer — if the user doesn't decide in time,
+                # push an approval.resolved(expired=true) event to the SSE stream
+                _run_id_local = run_id
+                _approval_id_local = approval_id
+                _timeout_secs = enriched["timeout"]
+                _loop = loop
+
+                def _approval_expired():
+                    """Push approval.resolved(expired=true) to the SSE queue."""
+                    self._approval_timeout_handles.pop((_run_id_local, _approval_id_local), None)
+                    run_q = self._run_streams.get(_run_id_local)
+                    if run_q is not None:
+                        try:
+                            run_q.put_nowait({
+                                "event": "approval.resolved",
+                                "run_id": _run_id_local,
+                                "approval_id": _approval_id_local,
+                                "decision": "deny",
+                                "expired": True,
+                                "timestamp": time.time(),
+                            })
+                        except Exception:
+                            pass
+
+                handle = _loop.call_later(_timeout_secs, _approval_expired)
+                self._approval_timeout_handles[(_run_id_local, _approval_id_local)] = handle
+
+            # Set session context for Rails-originated runs so that tools
+            # (e.g. cronjob) can capture origin = aziendaos:{chat_id}.
+            _session_tokens = None
+            if isinstance(session_id, str) and session_id.startswith("rails-session-"):
+                _chat_id = session_id.removeprefix("rails-session-").strip()
+                if _chat_id:
+                    from gateway.session_context import set_session_vars
+                    _session_tokens = set_session_vars(platform="aziendaos", chat_id=_chat_id, session_key=f"aziendaos:{_chat_id}")
+
             try:
-                self._set_run_status(run_id, "running")
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
-                    session_id=session_id,
+                    session_id=execution_session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    tool_complete_callback=_tool_complete_cb,
+                    reasoning_callback=lambda text: event_cb("reasoning.available", "_thinking", text, None),
                 )
                 self._active_run_agents[run_id] = agent
+                from tools.approval import (
+                    register_gateway_notify,
+                    set_current_session_key,
+                    reset_current_session_key,
+                    unregister_gateway_notify,
+                )
+
                 def _run_sync():
-                    effective_task_id = session_id or run_id
-                    r = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
-                    )
+                    _token = set_current_session_key(_api_approval_session_key)
+                    register_gateway_notify(_api_approval_session_key, _approval_notify_sync)
+                    try:
+                        r = agent.run_conversation(
+                            user_message=user_message,
+                            conversation_history=conversation_history,
+                            task_id="default",
+                        )
+                    finally:
+                        unregister_gateway_notify(_api_approval_session_key)
+                        reset_current_session_key(_token)
                     u = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -2567,6 +3099,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+
                 q.put_nowait({
                     "event": "run.completed",
                     "run_id": run_id,
@@ -2574,36 +3107,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output": final_response,
                     "usage": usage,
                 })
-                self._set_run_status(
-                    run_id,
-                    "completed",
-                    output=final_response,
-                    usage=usage,
-                    last_event="run.completed",
-                )
-            except asyncio.CancelledError:
-                self._set_run_status(
-                    run_id,
-                    "cancelled",
-                    last_event="run.cancelled",
-                )
-                try:
-                    q.put_nowait({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
-                except Exception:
-                    pass
-                raise
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
-                self._set_run_status(
-                    run_id,
-                    "failed",
-                    error=str(exc),
-                    last_event="run.failed",
-                )
                 try:
                     q.put_nowait({
                         "event": "run.failed",
@@ -2621,6 +3126,24 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
+                # Clean up approval tracking for this run
+                self._run_approval_session_keys.pop(run_id, None)
+                stale_keys = [k for k in list(self._run_approval_ids)
+                              if k[0] == run_id]
+                for k in stale_keys:
+                    self._run_approval_ids.pop(k, None)
+                    self._approval_session_map.pop(k[1], None)
+                # Cancel any pending approval timeout timers for this run
+                stale_timers = [k for k in list(self._approval_timeout_handles)
+                                if k[0] == run_id]
+                for k in stale_timers:
+                    handle = self._approval_timeout_handles.pop(k, None)
+                    if handle:
+                        handle.cancel()
+                # Clear session context vars set for this run
+                if _session_tokens is not None:
+                    from gateway.session_context import clear_session_vars
+                    clear_session_vars(_session_tokens)
 
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
@@ -2631,22 +3154,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
-        return web.json_response({"run_id": run_id, "status": "started"}, status=202)
-
-    async def _handle_get_run(self, request: "web.Request") -> "web.Response":
-        """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
-        if status is None:
-            return web.json_response(
-                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
-                status=404,
-            )
-        return web.json_response(status)
+        return web.json_response({
+            "run_id": run_id,
+            "status": "started",
+            "session_id": session_id,
+            "resolved_session_id": resolved_session_id,
+        }, status=202)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
@@ -2710,8 +3223,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if agent is None and task is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        self._set_run_status(run_id, "stopping", last_event="run.stopping")
-
         if agent is not None:
             try:
                 agent.interrupt("Stop requested via API")
@@ -2737,6 +3248,101 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
+    async def _handle_run_approval(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/approvals/{approval_id} — decide on a pending approval.
+
+        Body:
+            {"decision": "once"|"session"|"always"|"deny"}
+
+        This calls resolve_gateway_approval to unblock the waiting agent thread.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        approval_id = request.match_info["approval_id"]
+
+        # Resolve session key from our mappings
+        session_key = self._run_approval_session_keys.get(run_id)
+        if session_key is None:
+            return web.json_response(
+                _openai_error(f"Run not found or no pending approvals: {run_id}",
+                              code="run_not_found"),
+                status=404,
+            )
+
+        # Validate the approval_id
+        if self._run_approval_ids.get((run_id, approval_id)) != session_key:
+            return web.json_response(
+                _openai_error(f"Approval not found: {approval_id}",
+                              code="approval_not_found"),
+                status=404,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        decision = body.get("decision", "").strip().lower()
+        if decision not in ("once", "session", "always", "deny"):
+            return web.json_response(
+                _openai_error(f"Invalid decision: {decision!r}. Must be one of: once, session, always, deny",
+                              code="invalid_decision"),
+                status=400,
+            )
+
+        from tools.approval import resolve_gateway_approval, has_blocking_approval
+
+        if not has_blocking_approval(session_key):
+            return web.json_response(
+                _openai_error("No pending approval for this session",
+                              code="no_pending_approval"),
+                status=409,
+            )
+
+        count = resolve_gateway_approval(session_key, decision)
+        if not count:
+            return web.json_response(
+                _openai_error("No pending command to approve",
+                              code="no_pending_approval"),
+                status=409,
+            )
+
+        # Clean up our mapping (keep session_key for the run in case more approvals arrive)
+        self._run_approval_ids.pop((run_id, approval_id), None)
+        self._approval_session_map.pop(approval_id, None)
+
+        # Cancel the auto-expire timer since the user responded
+        timer_handle = self._approval_timeout_handles.pop((run_id, approval_id), None)
+        if timer_handle is not None:
+            timer_handle.cancel()
+
+        # Push approval.resolved SSE event so the Rails client knows the outcome
+        run_q = self._run_streams.get(run_id)
+        if run_q is not None:
+            try:
+                run_q.put_nowait({
+                    "event": "approval.resolved",
+                    "run_id": run_id,
+                    "approval_id": approval_id,
+                    "decision": decision,
+                    "expired": decision == "deny",
+                    "timestamp": time.time(),
+                })
+            except Exception:
+                pass
+
+        logger.info(
+            "[api_server] run %s approval %s: decision=%s",
+            run_id, approval_id, decision,
+        )
+        return web.json_response({
+            "status": "processed",
+            "decision": decision,
+        })
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -2753,15 +3359,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_streams_created.pop(run_id, None)
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
-
-            stale_statuses = [
-                run_id
-                for run_id, status in list(self._run_statuses.items())
-                if status.get("status") in {"completed", "failed", "cancelled"}
-                and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL
-            ]
-            for run_id in stale_statuses:
-                self._run_statuses.pop(run_id, None)
+                # Clean up orphaned approval tracking data
+                self._run_approval_session_keys.pop(run_id, None)
+                stale_keys = [k for k in list(self._run_approval_ids)
+                              if k[0] == run_id]
+                for k in stale_keys:
+                    self._run_approval_ids.pop(k, None)
+                    self._approval_session_map.pop(k[1], None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -2781,7 +3385,6 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
-            self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
@@ -2797,9 +3400,14 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
-            self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # Approval endpoint
+            self._app.router.add_post("/v1/runs/{run_id}/approvals/{approval_id}", self._handle_run_approval)
+            # Generated file media endpoint (path-based)
+            self._app.router.add_get("/v1/files/media", self._handle_file_media)
+            # Session read-only endpoint
+            self._app.router.add_get("/v1/sessions/{session_id}", self._handle_get_session)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
@@ -2836,6 +3444,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
 
             # Port conflict detection — fail fast if port is already in use
+            # Ensure generated files directory exists
+            os.makedirs(self._generated_files_dir, mode=0o755, exist_ok=True)
             try:
                 with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
                     _s.settimeout(1)
