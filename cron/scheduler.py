@@ -454,7 +454,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     "content": content,
                 }).encode()
                 req = urllib.request.Request(
-                    f"{rails_url}/api/cron_deliveries",
+                    f"{web_ui_url}/api/cron_deliveries",
                     data=payload,
                     headers={"Content-Type": "application/json"},
                     method="POST",
