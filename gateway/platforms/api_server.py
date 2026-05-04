@@ -2295,6 +2295,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if "origin" in body:
+                kwargs["origin"] = body["origin"]
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})
@@ -2422,6 +2424,17 @@ class APIServerAdapter(BasePlatformAdapter):
         if id_err:
             return id_err
         try:
+            if request.can_read_body:
+                body = await request.json()
+            else:
+                body = {}
+            overrides = {}
+            if "deliver" in body:
+                overrides["deliver"] = body["deliver"]
+            if "origin" in body:
+                overrides["origin"] = body["origin"]
+            if overrides:
+                _cron_update(job_id, overrides)
             job = _cron_trigger(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
