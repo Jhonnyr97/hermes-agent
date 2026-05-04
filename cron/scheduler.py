@@ -445,7 +445,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # create dynamic members via Platform._missing_().
         # Handle web delivery: POST directly to the web UI endpoint
         if platform_name.lower() == "web":
-            rails_url = os.getenv("HERMES_WEB_UI_URL", "http://hermes-ui:4000")
+            web_ui_url = os.getenv("HERMES_WEB_UI_URL", "http://hermes-ui:4000")
             try:
                 import urllib.request, urllib.error
                 payload = json.dumps({
