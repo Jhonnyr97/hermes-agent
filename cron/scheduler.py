@@ -77,7 +77,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
-    "qqbot", "yuanbao",
+    "qqbot", "yuanbao", "web",
 })
 
 # Platforms that support a configured cron/notification home target, mapped to
@@ -245,6 +245,16 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     if platform_name.lower() not in _KNOWN_DELIVERY_PLATFORMS:
         return None
+
+    # web delivery doesn't use home target chat_id — it POSTs to the web app endpoint
+    if platform_name.lower() == "web":
+        chat_id = origin.get("chat_id", "1") if origin else "1"
+        return {
+            "platform": "web",
+            "chat_id": chat_id,
+            "thread_id": None,
+        }
+
     chat_id = _get_home_target_chat_id(platform_name)
     if not chat_id:
         return None
@@ -433,6 +443,45 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         # Built-in names resolve to their enum member; plugin platform names
         # create dynamic members via Platform._missing_().
+        # Handle web delivery: POST directly to the web UI endpoint
+        if platform_name.lower() == "web":
+            rails_url = os.getenv("HERMES_WEB_UI_URL", "http://hermes-ui:4000")
+            try:
+                import urllib.request, urllib.error
+                payload = json.dumps({
+                    "job_id": job["id"],
+                    "session_id": chat_id,
+                    "content": content,
+                }).encode()
+                req = urllib.request.Request(
+                    f"{rails_url}/api/cron_deliveries",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    if resp.status >= 400:
+                        raise urllib.error.HTTPError(
+                            resp.url, resp.status, resp.msg, resp.headers, None
+                        )
+                logger.info("Job '%s': delivered to web UI (session %s)", job["id"], chat_id)
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    logger.warning(
+                        "Job '%s': web delivery target session %s not found; "
+                        "the UI will auto-create it on next delivery",
+                        job["id"], chat_id,
+                    )
+                else:
+                    msg = f"web delivery failed: HTTP {e.code}"
+                    logger.error("Job '%s': %s", job["id"], msg)
+                    delivery_errors.append(msg)
+            except Exception as e:
+                msg = f"web delivery failed: {e}"
+                logger.error("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+            continue
+
         try:
             platform = Platform(platform_name.lower())
         except (ValueError, KeyError):
