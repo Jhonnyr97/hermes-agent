@@ -246,7 +246,7 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
     if platform_name.lower() not in _KNOWN_DELIVERY_PLATFORMS:
         return None
 
-    # web delivery doesn't use home target chat_id — it POSTs to the Rails endpoint
+    # web delivery doesn't use home target chat_id — it POSTs to the web app endpoint
     if platform_name.lower() == "web":
         chat_id = origin.get("chat_id", "1") if origin else "1"
         return {
