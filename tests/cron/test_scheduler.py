@@ -2219,6 +2219,7 @@ class TestWebDelivery:
         with (
             patch("cron.scheduler.load_config", return_value={}),
             patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen,
+            patch.dict(os.environ, {"HERMES_WEB_UI_URL": "http://localhost:4000"}),
         ):
             self._mock_response(mock_urlopen)
 
@@ -2283,7 +2284,7 @@ class TestWebDelivery:
         with (
             patch("cron.scheduler.load_config", return_value={}),
             patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen,
-            patch.dict(os.environ, {"HERMES_WEB_DELIVERY_TOKEN": "s3cr3t"}),
+            patch.dict(os.environ, {"HERMES_WEB_DELIVERY_TOKEN": "s3cr3t", "HERMES_WEB_UI_URL": "http://localhost:4000"}),
         ):
             self._mock_response(mock_urlopen)
 
@@ -2302,6 +2303,7 @@ class TestWebDelivery:
         with (
             patch("cron.scheduler.load_config", return_value={}),
             patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen,
+            patch.dict(os.environ, {"HERMES_WEB_UI_URL": "http://localhost:4000"}),
         ):
             self._mock_response(mock_urlopen)
 
@@ -2317,17 +2319,20 @@ class TestWebDelivery:
             "id": "web-404-job",
             "deliver": "web",
         }
-        with patch("cron.scheduler.load_config", return_value={}) as mock_cfg:
-            with patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen:
-                self._mock_response(mock_urlopen, status=404)
-                # urllib.request.urlopen raises HTTPError on 4xx
-                import urllib.error
-                mock_urlopen.side_effect = urllib.error.HTTPError(
-                    "http://localhost:4000/api/cron_deliveries", 404,
-                    "Not Found", {}, None,
-                )
+        with (
+            patch("cron.scheduler.load_config", return_value={}),
+            patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen,
+            patch.dict(os.environ, {"HERMES_WEB_UI_URL": "http://localhost:4000"}),
+        ):
+            self._mock_response(mock_urlopen, status=404)
+            # urllib.request.urlopen raises HTTPError on 4xx
+            import urllib.error
+            mock_urlopen.side_effect = urllib.error.HTTPError(
+                "http://localhost:4000/api/cron_deliveries", 404,
+                "Not Found", {}, None,
+            )
 
-                result = _deliver_result(job, "404 test")
+            result = _deliver_result(job, "404 test")
 
         assert result is not None
         assert "HTTP 404" in result
@@ -2338,9 +2343,12 @@ class TestWebDelivery:
             "id": "web-fail-job",
             "deliver": "web",
         }
-        with patch("cron.scheduler.load_config", return_value={}):
-            with patch("urllib.request.urlopen", side_effect=ConnectionError("Network down")):
-                result = _deliver_result(job, "Content")
+        with (
+            patch("cron.scheduler.load_config", return_value={}),
+            patch("urllib.request.urlopen", side_effect=ConnectionError("Network down")),
+            patch.dict(os.environ, {"HERMES_WEB_UI_URL": "http://localhost:4000"}),
+        ):
+            result = _deliver_result(job, "Content")
 
         assert result is not None
         assert "web delivery failed" in result
@@ -2356,6 +2364,7 @@ class TestWebDelivery:
         with (
             patch("cron.scheduler.load_config", return_value={}),
             patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen,
+            patch.dict(os.environ, {"HERMES_WEB_UI_URL": "http://localhost:4000"}),
         ):
             self._mock_response(mock_urlopen)
 
@@ -2373,6 +2382,7 @@ class TestWebDelivery:
         with (
             patch("cron.scheduler.load_config", return_value={}),
             patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen,
+            patch.dict(os.environ, {"HERMES_WEB_UI_URL": "http://localhost:4000"}),
         ):
             self._mock_response(mock_urlopen)
 
@@ -2384,3 +2394,17 @@ class TestWebDelivery:
         assert payload["job_id"] == "web-session-job"
         assert payload["session_id"] == "web-session-job"
         assert "Check session_id" in payload["content"]
+
+    def test_deliver_result_fails_without_config(self):
+        """Without HERMES_WEB_UI_URL or config.yaml, delivery returns an error."""
+        job = {
+            "id": "web-no-config-job",
+            "deliver": "web",
+        }
+        with patch("cron.scheduler.load_config", return_value={}):
+            result = _deliver_result(job, "Content")
+
+        assert result is not None
+        assert "requires configuration" in result
+        assert "cron.web_ui_url" in result
+        assert "HERMES_WEB_UI_URL" in result

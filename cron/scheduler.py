@@ -370,20 +370,34 @@ def _deliver_web(job: dict, content: str) -> Optional[str]:
     URL resolution order:
       1. ``cron.web_ui_url`` in ``config.yaml``
       2. ``HERMES_WEB_UI_URL`` env var
-      3. ``http://localhost:4000`` (default)
+
+    At least one of the above must be set, or the delivery fails with an
+    error message.  Unlike chat platforms (Telegram, Discord, Slack)
+    which have sensible defaults for home channels, web delivery has
+    no channel concept and no reasonable default URL.
 
     Optional auth: set ``HERMES_WEB_DELIVERY_TOKEN`` env var to send
-    ``Authorization: Bearer <token>`` with every POST.  When unset,
+    ``Authorization: Bearer *** with every POST.  When unset,
     no auth header is sent.
 
     Returns None on success, or an error string on failure.
     """
-    # Resolve URL: config.yaml > env var > default
-    web_ui_url = "http://localhost:4000"
+    # Resolve URL: config.yaml > env var (both required — no default)
+    web_ui_url = ""
     try:
         cfg = load_config()
-        web_ui_url = cfg.get("cron", {}).get("web_ui_url") or os.getenv("HERMES_WEB_UI_URL") or web_ui_url
+        web_ui_url = cfg.get("cron", {}).get("web_ui_url", "")
     except Exception:
+        pass
+
+    if not web_ui_url:
+        web_ui_url = os.getenv("HERMES_WEB_UI_URL", "")
+
+    if not web_ui_url:
+        return (
+            "web delivery requires configuration: set 'cron.web_ui_url' "
+            "in config.yaml or HERMES_WEB_UI_URL environment variable"
+        )
         web_ui_url = os.getenv("HERMES_WEB_UI_URL", web_ui_url)
 
     delivery_token = os.getenv("HERMES_WEB_DELIVERY_TOKEN", "")
