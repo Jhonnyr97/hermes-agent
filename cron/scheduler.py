@@ -398,7 +398,6 @@ def _deliver_web(job: dict, content: str) -> Optional[str]:
             "web delivery requires configuration: set 'cron.web_ui_url' "
             "in config.yaml or HERMES_WEB_UI_URL environment variable"
         )
-        web_ui_url = os.getenv("HERMES_WEB_UI_URL", web_ui_url)
 
     delivery_token = os.getenv("HERMES_WEB_DELIVERY_TOKEN", "")
 
