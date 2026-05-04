@@ -2200,6 +2200,12 @@ class TestSendMediaTimeoutCancelsFuture:
 class TestWebDelivery:
     """Web delivery platform — cron result POSTs directly to the web UI."""
 
+    def _mock_response(self, mock_urlopen, status=200):
+        mock_response = MagicMock()
+        mock_response.status = status
+        mock_urlopen.return_value = mock_response
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
     def test_web_in_known_platforms(self):
         assert "web" in _KNOWN_DELIVERY_PLATFORMS
 
@@ -2210,11 +2216,11 @@ class TestWebDelivery:
             "name": "daily-report",
             "deliver": "web",
         }
-        with patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen:
-            mock_response = MagicMock()
-            mock_response.status = 200
-            mock_urlopen.return_value = mock_response
-            mock_urlopen.return_value.__enter__.return_value = mock_response
+        with (
+            patch("cron.scheduler.load_config", return_value={}),
+            patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen,
+        ):
+            self._mock_response(mock_urlopen)
 
             result = _deliver_result(job, "Web delivery test content")
 
@@ -2234,20 +2240,97 @@ class TestWebDelivery:
             "deliver": "web",
         }
         with (
+            patch("cron.scheduler.load_config", return_value={}),
             patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen,
             patch.dict(os.environ, {"HERMES_WEB_UI_URL": custom_url}),
         ):
-            mock_response = MagicMock()
-            mock_response.status = 200
-            mock_urlopen.return_value = mock_response
-            mock_urlopen.return_value.__enter__.return_value = mock_response
+            self._mock_response(mock_urlopen)
 
             result = _deliver_result(job, "Content")
 
         assert result is None
         mock_urlopen.assert_called_once()
         req = mock_urlopen.call_args[0][0]
-        assert custom_url in str(req.full_url) or custom_url in str(req.origin)
+        assert custom_url in str(req.full_url)
+
+    def test_deliver_result_uses_config_url(self):
+        """cron.web_ui_url in config.yaml takes precedence over env var."""
+        custom_url = "https://config-based.example.com"
+        job = {
+            "id": "web-cfg-url",
+            "deliver": "web",
+        }
+        config_with_url = {"cron": {"web_ui_url": custom_url}}
+        with (
+            patch("cron.scheduler.load_config", return_value=config_with_url),
+            patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen,
+        ):
+            self._mock_response(mock_urlopen)
+
+            result = _deliver_result(job, "Content")
+
+        assert result is None
+        mock_urlopen.assert_called_once()
+        req = mock_urlopen.call_args[0][0]
+        assert custom_url in str(req.full_url)
+
+    def test_deliver_result_sends_auth_token(self):
+        """HERMES_WEB_DELIVERY_TOKEN sends Authorization header."""
+        job = {
+            "id": "web-auth-job",
+            "deliver": "web",
+        }
+        with (
+            patch("cron.scheduler.load_config", return_value={}),
+            patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen,
+            patch.dict(os.environ, {"HERMES_WEB_DELIVERY_TOKEN": "s3cr3t"}),
+        ):
+            self._mock_response(mock_urlopen)
+
+            result = _deliver_result(job, "Auth test")
+
+        assert result is None
+        req = mock_urlopen.call_args[0][0]
+        assert req.headers.get("Authorization") == "Bearer s3cr3t"
+
+    def test_deliver_result_no_auth_when_token_unset(self):
+        """No Authorization header when HERMES_WEB_DELIVERY_TOKEN is not set."""
+        job = {
+            "id": "web-no-auth-job",
+            "deliver": "web",
+        }
+        with (
+            patch("cron.scheduler.load_config", return_value={}),
+            patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen,
+        ):
+            self._mock_response(mock_urlopen)
+
+            result = _deliver_result(job, "No auth")
+
+        assert result is None
+        req = mock_urlopen.call_args[0][0]
+        assert "Authorization" not in req.headers
+
+    def test_deliver_result_handles_404(self):
+        """HTTP 404 returns an error, not success."""
+        job = {
+            "id": "web-404-job",
+            "deliver": "web",
+        }
+        with patch("cron.scheduler.load_config", return_value={}) as mock_cfg:
+            with patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen:
+                self._mock_response(mock_urlopen, status=404)
+                # urllib.request.urlopen raises HTTPError on 4xx
+                import urllib.error
+                mock_urlopen.side_effect = urllib.error.HTTPError(
+                    "http://localhost:4000/api/cron_deliveries", 404,
+                    "Not Found", {}, None,
+                )
+
+                result = _deliver_result(job, "404 test")
+
+        assert result is not None
+        assert "HTTP 404" in result
 
     def test_deliver_result_handles_failure_gracefully(self):
         """If web POST fails, _deliver_result returns an error message, doesn't crash."""
@@ -2255,8 +2338,9 @@ class TestWebDelivery:
             "id": "web-fail-job",
             "deliver": "web",
         }
-        with patch("urllib.request.urlopen", side_effect=ConnectionError("Network down")):
-            result = _deliver_result(job, "Content")
+        with patch("cron.scheduler.load_config", return_value={}):
+            with patch("urllib.request.urlopen", side_effect=ConnectionError("Network down")):
+                result = _deliver_result(job, "Content")
 
         assert result is not None
         assert "web delivery failed" in result
@@ -2269,11 +2353,11 @@ class TestWebDelivery:
             "deliver": "web",
             "origin": {"platform": "telegram", "chat_id": "123"},
         }
-        with patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen:
-            mock_response = MagicMock()
-            mock_response.status = 200
-            mock_urlopen.return_value = mock_response
-            mock_urlopen.return_value.__enter__.return_value = mock_response
+        with (
+            patch("cron.scheduler.load_config", return_value={}),
+            patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen,
+        ):
+            self._mock_response(mock_urlopen)
 
             result = _deliver_result(job, "Origin override test")
 
@@ -2281,16 +2365,16 @@ class TestWebDelivery:
         mock_urlopen.assert_called_once()
 
     def test_deliver_result_sends_session_id_in_payload(self):
-        """The session_id from the resolved delivery target is sent in the JSON payload."""
+        """The session_id equals job_id in the JSON payload."""
         job = {
             "id": "web-session-job",
             "deliver": "web",
         }
-        with patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen:
-            mock_response = MagicMock()
-            mock_response.status = 200
-            mock_urlopen.return_value = mock_response
-            mock_urlopen.return_value.__enter__.return_value = mock_response
+        with (
+            patch("cron.scheduler.load_config", return_value={}),
+            patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen,
+        ):
+            self._mock_response(mock_urlopen)
 
             result = _deliver_result(job, "Check session_id")
 

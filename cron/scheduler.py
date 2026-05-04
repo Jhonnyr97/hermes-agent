@@ -359,23 +359,57 @@ def _deliver_web(job: dict, content: str) -> Optional[str]:
 
     Used for ``deliver=web`` cron jobs.  POSTs the raw content
     (without wrapping or MEDIA stripping) as JSON to the configured
-    ``HERMES_WEB_UI_URL`` (default ``http://localhost:4000``).
+    web UI endpoint.
+
+    Why raw content (no wrapping, no MEDIA resolution)?
+    Unlike chat platforms (Telegram, Discord, Slack) which display
+    cron output inline with a "Cronjob Response:" header, the web UI
+    receives structured JSON and formats it in its own UI context.
+    Wrapping and MEDIA extraction are left to the receiving UI.
+
+    URL resolution order:
+      1. ``cron.web_ui_url`` in ``config.yaml``
+      2. ``HERMES_WEB_UI_URL`` env var
+      3. ``http://localhost:4000`` (default)
+
+    Optional auth: set ``HERMES_WEB_DELIVERY_TOKEN`` env var to send
+    ``Authorization: Bearer <token>`` with every POST.  When unset,
+    no auth header is sent.
 
     Returns None on success, or an error string on failure.
     """
-    web_ui_url = os.getenv("HERMES_WEB_UI_URL", "http://localhost:4000")
+    # Resolve URL: config.yaml > env var > default
+    web_ui_url = "http://localhost:4000"
+    try:
+        cfg = load_config()
+        web_ui_url = cfg.get("cron", {}).get("web_ui_url") or os.getenv("HERMES_WEB_UI_URL") or web_ui_url
+    except Exception:
+        web_ui_url = os.getenv("HERMES_WEB_UI_URL", web_ui_url)
+
+    delivery_token = os.getenv("HERMES_WEB_DELIVERY_TOKEN", "")
+
+    # session_id is intentionally set to job["id"] — the web UI uses it as a
+    # stable session key for the cron job.  Each execution POSTs to the same
+    # session_id, so the UI can overwrite/replace the previous output rather
+    # than accumulating duplicate entries.  If the session was deleted, the
+    # UI is expected to auto-create it on the next delivery.
+    payload = json.dumps({
+        "job_id": job["id"],
+        "session_id": job["id"],
+        "content": content,
+    }).encode()
+
+    headers = {"Content-Type": "application/json"}
+    if delivery_token:
+        headers["Authorization"] = f"Bearer {delivery_token}"
+
     try:
         import urllib.request, urllib.error
 
-        payload = json.dumps({
-            "job_id": job["id"],
-            "session_id": job["id"],
-            "content": content,
-        }).encode()
         req = urllib.request.Request(
             f"{web_ui_url}/api/cron_deliveries",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -385,16 +419,9 @@ def _deliver_web(job: dict, content: str) -> Optional[str]:
                 )
         logger.info("Job '%s': delivered to web UI", job["id"])
     except urllib.error.HTTPError as e:
-        if e.code == 404:
-            logger.warning(
-                "Job '%s': web delivery target not found; "
-                "the UI will auto-create it on next delivery",
-                job["id"],
-            )
-        else:
-            msg = f"web delivery failed: HTTP {e.code}"
-            logger.error("Job '%s': %s", job["id"], msg)
-            return msg
+        msg = f"web delivery failed: HTTP {e.code}"
+        logger.error("Job '%s': %s", job["id"], msg)
+        return msg
     except Exception as e:
         msg = f"web delivery failed: {e}"
         logger.error("Job '%s': %s", job["id"], msg)
@@ -504,10 +531,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # Web delivery is handled before the target loop (see _deliver_web above).
         # This branch is dead code for web — if it somehow reaches here, log and skip.
         if platform_name.lower() == "web":
-            logger.warning(
-                "Job '%s': web delivery hit loop target unexpectedly (deliver=%s)",
-                job["id"], job.get("deliver", "local"),
-            )
+            msg = f"web delivery hit loop target unexpectedly (deliver={job.get('deliver', 'local')})"
+            logger.error("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
             continue
 
         try:
