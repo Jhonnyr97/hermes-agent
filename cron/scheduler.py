@@ -77,7 +77,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
-    "qqbot", "yuanbao",
+    "qqbot", "yuanbao", "web",
 })
 
 # Platforms that support a configured cron/notification home target, mapped to
@@ -245,6 +245,7 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     if platform_name.lower() not in _KNOWN_DELIVERY_PLATFORMS:
         return None
+
     chat_id = _get_home_target_chat_id(platform_name)
     if not chat_id:
         return None
@@ -353,6 +354,91 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
+def _deliver_web(job: dict, content: str) -> Optional[str]:
+    """POST cron job output to the web UI endpoint.
+
+    Used for ``deliver=web`` cron jobs.  POSTs the raw content
+    (without wrapping or MEDIA stripping) as JSON to the configured
+    web UI endpoint.
+
+    Why raw content (no wrapping, no MEDIA resolution)?
+    Unlike chat platforms (Telegram, Discord, Slack) which display
+    cron output inline with a "Cronjob Response:" header, the web UI
+    receives structured JSON and formats it in its own UI context.
+    Wrapping and MEDIA extraction are left to the receiving UI.
+
+    URL resolution order:
+      1. ``cron.web_ui_url`` in ``config.yaml``
+      2. ``HERMES_WEB_UI_URL`` env var
+
+    At least one of the above must be set, or the delivery fails with an
+    error message.  Unlike chat platforms (Telegram, Discord, Slack)
+    which have sensible defaults for home channels, web delivery has
+    no channel concept and no reasonable default URL.
+
+    Optional auth: set ``HERMES_WEB_DELIVERY_TOKEN`` env var to send
+    ``Authorization: Bearer *** with every POST.  When unset,
+    no auth header is sent.
+
+    Returns None on success, or an error string on failure.
+    """
+    # Resolve URL: config.yaml > env var (both required — no default)
+    web_ui_url = ""
+    try:
+        cfg = load_config()
+        web_ui_url = cfg.get("cron", {}).get("web_ui_url", "")
+    except Exception:
+        pass
+
+    if not web_ui_url:
+        web_ui_url = os.getenv("HERMES_WEB_UI_URL", "")
+
+    if not web_ui_url:
+        return (
+            "web delivery requires configuration: set 'cron.web_ui_url' "
+            "in config.yaml or HERMES_WEB_UI_URL environment variable"
+        )
+
+    delivery_token = os.getenv("HERMES_WEB_DELIVERY_TOKEN", "")
+
+    # session_id is intentionally set to job["id"] — the web UI uses it as a
+    # stable session key for the cron job.  Each execution POSTs to the same
+    # session_id, so the UI can overwrite/replace the previous output rather
+    # than accumulating duplicate entries.  If the session was deleted, the
+    # UI is expected to auto-create it on the next delivery.
+    payload = json.dumps({
+        "job_id": job["id"],
+        "session_id": job["id"],
+        "content": content,
+    }).encode()
+
+    headers = {"Content-Type": "application/json"}
+    if delivery_token:
+        headers["Authorization"] = f"Bearer {delivery_token}"
+
+    try:
+        import urllib.request, urllib.error
+
+        req = urllib.request.Request(
+            f"{web_ui_url}/api/cron_deliveries",
+            data=payload,
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15):
+            pass
+        logger.info("Job '%s': delivered to web UI", job["id"])
+    except urllib.error.HTTPError as e:
+        msg = f"web delivery failed: HTTP {e.code}"
+        logger.error("Job '%s': %s", job["id"], msg)
+        return msg
+    except Exception as e:
+        msg = f"web delivery failed: {e}"
+        logger.error("Job '%s': %s", job["id"], msg)
+        return msg
+    return None
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -364,6 +450,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    # Handle web delivery first — no platform adapter or target resolution needed
+    deliver = _normalize_deliver_value(job.get("deliver", "local"))
+    parts = [p.strip().lower() for p in deliver.split(",") if p.strip()]
+
+    # Extract "web" from delivery parts and handle it directly
+    has_web = "web" in parts
+    if has_web and all(p == "web" for p in parts):
+        # Only web delivery — skip target resolution entirely
+        return _deliver_web(job, content)
+
+    if has_web:
+        # Mixed: handle web first, then strip it for remaining targets
+        err = _deliver_web(job, content)
+        if err:
+            return err
+        # Strip "web" from deliver, keep remaining platforms
+        remaining = ",".join(p for p in parts if p != "web")
+        job = {**job, "deliver": remaining}
+
     targets = _resolve_delivery_targets(job)
     if not targets:
         if job.get("deliver", "local") != "local":
@@ -433,6 +538,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         # Built-in names resolve to their enum member; plugin platform names
         # create dynamic members via Platform._missing_().
+        # Web delivery is handled before the target loop (see _deliver_web above).
+        # This branch is dead code for web — if it somehow reaches here, log and skip.
+        if platform_name.lower() == "web":
+            msg = f"web delivery hit loop target unexpectedly (deliver={job.get('deliver', 'local')})"
+            logger.error("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            continue
+
         try:
             platform = Platform(platform_name.lower())
         except (ValueError, KeyError):
