@@ -14,8 +14,15 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # that would otherwise accumulate when hermes runs as PID 1. See #15012.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    build-essential curl nodejs npm python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git openssh-client docker-cli tini && \
+    build-essential curl python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git openssh-client docker-cli tini xz-utils ca-certificates && \
     rm -rf /var/lib/apt/lists/*
+
+# Install Node.js >= 22 (official binary, not Debian's v20)
+ENV NODE_VERSION=22.14.0
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.xz" | \
+    tar -xJf - -C /usr/local --strip-components=1 && \
+    ln -sf /usr/local/bin/node /usr/local/bin/nodejs && \
+    corepack enable
 
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
 RUN useradd -u 10000 -m -d /opt/data hermes
@@ -74,6 +81,24 @@ RUN chmod -R a+rX /opt/hermes
 # ---------- Python virtualenv ----------
 RUN uv venv && \
     uv pip install --no-cache-dir -e ".[all]"
+
+# ---------- AziendaOS extras ----------
+# Node.js libraries for Office skills (pptx, docx)
+RUN npm install --no-audit --no-fund pptxgenjs docx && \
+    npm cache clean --force
+ENV NODE_PATH=/opt/hermes/node_modules
+# Python libraries for Office + Audio skills
+RUN uv pip install --no-cache-dir python-docx openpyxl pypdf reportlab markitdown[all] gtts pydub && \
+    uv cache clean
+# Make venv packages importable from any shell (terminal() uses sh -c, not bash -l)
+ENV PYTHONPATH="/opt/hermes/.venv/lib/python3.13/site-packages"
+# Symlink useful CLI entry points so they work from sh
+RUN ln -sf /opt/hermes/.venv/bin/markitdown /usr/local/bin/markitdown
+RUN bash -c 'chrome_path=$(find /opt/hermes/.playwright -name "headless_shell" -type f 2>/dev/null | head -1); if [ -n "$chrome_path" ]; then ln -sf "$chrome_path" /usr/local/bin/chrome-headless-shell; fi'
+# bash -l (used by Hermes terminal tool) resets PATH — fix via profile.d
+RUN mkdir -p /etc/profile.d && \
+    echo 'export PATH="/opt/hermes/.venv/bin:$PATH"' > /etc/profile.d/hermes.sh && \
+    echo 'export NODE_PATH="/opt/hermes/node_modules"' >> /etc/profile.d/hermes.sh
 
 # ---------- Runtime ----------
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist

@@ -500,7 +500,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "deliver": {
                 "type": "string",
-                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), or platform:chat_id:thread_id for a specific destination. Examples: 'telegram:-1001234567890:17585', 'discord:#engineering', 'sms:+15551234567'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting."
+                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), 'web' (deliver to the web UI via the cron delivery endpoint), or platform:chat_id:thread_id for a specific destination. Examples: 'telegram:-1001234567890:17585', 'discord:#engineering', 'web', 'sms:+155****4567'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting.\n\nWhen 'web' is used, origin is automatically set from the environment (HERMES_WEB_ORIGIN_PLATFORM, HERMES_WEB_CHAT_ID). The web UI's delivery endpoint receives the output. If the target session was deleted, the UI auto-creates a new session and shows a badge indicating the output came from a cron job."
             },
             "skills": {
                 "type": "array",

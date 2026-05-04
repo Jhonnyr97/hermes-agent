@@ -34,6 +34,9 @@ import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 from typing import Any, Dict, List, Optional
 
 try:
@@ -135,6 +138,91 @@ def _normalize_chat_content(
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
 _FILE_PART_TYPES = frozenset({"file", "input_file"})
+_FILE_URL_PART_TYPES = frozenset({"file_url", "input_file_url"})
+_FILE_PATH_PART_TYPES = frozenset({"file_path"})
+_SHARED_UPLOADS_DIR = Path(os.environ.get("SHARED_UPLOADS_DIR", "/mnt/shared-uploads"))
+_FILE_URL_DOWNLOAD_DIR = Path(os.environ.get("FILE_URL_DOWNLOAD_DIR", "/tmp/hermes-file-urls"))
+_ALLOWED_FILE_URL_HOSTS = {
+    host.strip().lower()
+    for host in os.environ.get("ALLOWED_FILE_URL_HOSTS", "hermes-ui,localhost,127.0.0.1").split(",")
+    if host.strip()
+}
+_MAX_FILE_READ_BYTES = 100 * 1024 * 1024  # 100 MB max preview
+
+
+def _safe_download_filename(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name or "file").strip("._")
+    return safe[:160] or "file"
+
+
+def _read_file_part_summary(file_path: str, original_name: str, content_type: str) -> Dict[str, str]:
+    if not os.path.isfile(file_path):
+        return {
+            "type": "text",
+            "text": f"\n[File: {original_name} — not found at {file_path}]\n"
+        }
+
+    try:
+        file_size = os.path.getsize(file_path)
+        if file_size > _MAX_FILE_READ_BYTES:
+            return {
+                "type": "text",
+                "text": f"\n[File: {original_name} ({content_type}) — {file_size} bytes, exceeds preview limit]\nFile path: {file_path}"
+            }
+
+        with open(file_path, "rb") as f:
+            raw = f.read()
+
+        try:
+            text = raw.decode("utf-8")
+            preview = text[:MAX_NORMALIZED_TEXT_LENGTH]
+            return {
+                "type": "text",
+                "text": f"\n[File: {original_name} ({content_type})]\n{preview}"
+            }
+        except UnicodeDecodeError:
+            return {
+                "type": "text",
+                "text": f"\n[File: {original_name} ({content_type}) — binary file, {file_size} bytes]\nFile path: {file_path}"
+            }
+    except Exception as e:
+        return {
+            "type": "text",
+            "text": f"\n[File: {original_name} — error reading: {e}]\n"
+        }
+
+
+def _download_file_url(file_url: str, original_name: str, expected_size: int | None = None) -> str:
+    parsed = urlparse(file_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("invalid_file_url:File URLs must use http or https.")
+
+    host = (parsed.hostname or "").lower()
+    if host not in _ALLOWED_FILE_URL_HOSTS:
+        raise ValueError(f"invalid_file_url:File URL host {host!r} is not allowed.")
+
+    _FILE_URL_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    destination = _FILE_URL_DOWNLOAD_DIR / f"{uuid.uuid4().hex}_{_safe_download_filename(original_name)}"
+    request = Request(file_url, headers={"User-Agent": "HermesFileFetcher/1.0"})
+    downloaded = 0
+
+    with urlopen(request, timeout=20) as response, open(destination, "wb") as output:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            downloaded += len(chunk)
+            if downloaded > _MAX_FILE_READ_BYTES:
+                output.close()
+                destination.unlink(missing_ok=True)
+                raise ValueError("file_too_large:File exceeds download limit.")
+            output.write(chunk)
+
+    if expected_size is not None and expected_size >= 0 and downloaded != expected_size:
+        destination.unlink(missing_ok=True)
+        raise ValueError("invalid_file_url:Downloaded file size did not match metadata.")
+
+    return str(destination)
 
 
 def _normalize_multimodal_content(content: Any) -> Any:
@@ -236,11 +324,63 @@ def _normalize_multimodal_content(content: Any) -> Any:
                 "but uploaded files and document inputs are not supported on this endpoint."
             )
 
+        if part_type in _FILE_URL_PART_TYPES:
+            file_info = part.get("file_url", {})
+            if not isinstance(file_info, dict):
+                raise ValueError("invalid_content_part:file_url must be an object.")
+
+            url_value = file_info.get("url", "")
+            original_name = str(file_info.get("original_name") or "file")
+            content_type = str(file_info.get("content_type") or "")
+            byte_size = file_info.get("byte_size")
+            expected_size = int(byte_size) if isinstance(byte_size, int) and byte_size >= 0 else None
+            if not isinstance(url_value, str) or not url_value.strip():
+                raise ValueError("invalid_file_url:File URL parts must include a non-empty URL.")
+
+            text_accum_len += 1
+            try:
+                file_path = _download_file_url(url_value.strip(), original_name, expected_size)
+                normalized_parts.append(_read_file_part_summary(file_path, original_name, content_type))
+            except ValueError:
+                raise
+            except Exception as e:
+                normalized_parts.append({
+                    "type": "text",
+                    "text": f"\n[File: {original_name} — download failed: {e}]\n"
+                })
+            continue
+
+        if part_type in _FILE_PATH_PART_TYPES:
+            file_info = part.get("file_path", {})
+            raw_path = file_info.get("path", "")
+            original_name = file_info.get("original_name", "file")
+            content_type = file_info.get("content_type", "")
+            text_accum_len += 1
+            if raw_path:
+                # Sandbox: resolve path and ensure it's under SHARED_UPLOADS_DIR
+                try:
+                    resolved = Path(raw_path).resolve()
+                    resolved.relative_to(_SHARED_UPLOADS_DIR.resolve())
+                except (ValueError, RuntimeError):
+                    normalized_parts.append({
+                        "type": "text",
+                        "text": f"\n[File: {original_name} — path outside allowed directory]\n"
+                    })
+                    continue
+                file_path = str(resolved)
+                normalized_parts.append(_read_file_part_summary(file_path, original_name, content_type))
+            else:
+                normalized_parts.append({
+                    "type": "text",
+                    "text": f"\n[File: {original_name} — no path provided]\n"
+                })
+            continue
+
         # Unknown part type — reject explicitly so clients get a clear error
         # instead of a silently dropped turn.
         raise ValueError(
             f"unsupported_content_type:Unsupported content part type {raw_type!r}. "
-            "Only text and image_url/input_image parts are supported."
+            "Only text, image_url/input_image, and file_url parts are supported."
         )
 
     if not normalized_parts:
@@ -266,6 +406,8 @@ def _content_has_visible_payload(content: Any) -> bool:
                 if ptype in _TEXT_PART_TYPES and str(part.get("text") or "").strip():
                     return True
                 if ptype in _IMAGE_PART_TYPES:
+                    return True
+                if ptype in _FILE_URL_PART_TYPES or ptype in _FILE_PATH_PART_TYPES:
                     return True
     return False
 
@@ -606,6 +748,21 @@ class APIServerAdapter(BasePlatformAdapter):
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Generated files directory — where write_file outputs land
+        self._generated_files_dir: str = extra.get(
+            "generated_files_dir",
+            os.getenv("HERMES_GENERATED_FILES_DIR", "/tmp"),
+        )
+        # Reasoning callback tracking: run_id → bool (true if reasoning was streamed via callback)
+        self._run_reasoning_callback_fired: Dict[str, bool] = {}
+        # Approval tracking: run_id → session_key for the gateway notify bridge
+        self._run_approval_session_keys: Dict[str, str] = {}
+        # Approval tracking: (run_id, approval_id) → session_key for decision validation
+        self._run_approval_ids: Dict[tuple[str, str], str] = {}
+        # Approval tracking: approval_id → session_key for resolve_gateway_approval
+        self._approval_session_map: Dict[str, str] = {}
+        # Approval tracking: (run_id, approval_id) → asyncio.TimerHandle for auto-expire
+        self._approval_timeout_handles: Dict[tuple[str, str], "asyncio.TimerHandle"] = {}
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -728,6 +885,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2437,11 +2595,28 @@ class APIServerAdapter(BasePlatformAdapter):
                     "error": kwargs.get("is_error", False),
                 })
             elif event_type == "reasoning.available":
+                # Skip fallback from tool_progress_callback (line ~12904)
+                # when real reasoning was already streamed via reasoning_callback.
+                if self._run_reasoning_callback_fired.get(run_id):
+                    return
                 _push({
                     "event": "reasoning.available",
                     "run_id": run_id,
                     "timestamp": ts,
                     "text": preview or "",
+                })
+            elif event_type == "approval.requested":
+                approval_data = kwargs.get("approval_data") or {}
+                _push({
+                    "event": "approval.requested",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "approval_id": approval_data.get("id", ""),
+                    "command": approval_data.get("command", ""),
+                    "description": approval_data.get("description", ""),
+                    "choices": approval_data.get("choices", ["once", "session", "always", "deny"]),
+                    "timeout": approval_data.get("timeout", 300),
+                    "expires_at": approval_data.get("expires_at"),
                 })
             # _thinking and subagent_progress are intentionally not forwarded
 
@@ -2470,6 +2645,13 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
         user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
+        # Normalize multi-part content (text + file_url/image_url) so files
+        # get downloaded and converted to text before passing to the agent.
+        if isinstance(user_message, list):
+            try:
+                user_message = _normalize_multimodal_content(user_message)
+            except ValueError as exc:
+                return _multimodal_validation_error(exc, param="input[-1].content")
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
@@ -2522,6 +2704,25 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
+
+        # Canonical pattern: load conversation history from SessionDB
+        # when not provided by client. Mirrors gateway/run.py's
+        # session_store.load_transcript() — no platform adapter builds
+        # history manually (Telegram, Discord, Slack all follow this).
+        if not conversation_history and session_id and session_id != run_id:
+            try:
+                db = self._ensure_session_db()
+                if db:
+                    db_history = db.get_messages_as_conversation(session_id)
+                    if db_history:
+                        conversation_history = list(db_history)
+                        logger.debug(
+                            "[api_server] loaded %d messages from SessionDB for session %s",
+                            len(db_history), session_id,
+                        )
+            except Exception as exc:
+                logger.debug("[api_server] SessionDB load failed for %s: %s", session_id, exc)
+
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
@@ -2554,28 +2755,180 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         async def _run_and_close():
+            _api_approval_session_key = f"api-session-{session_id}"
+            _approval_notified = False
+            _current_approval_id = None
+
+            def _approval_notify_sync(approval_data: dict) -> None:
+                """Push approval.requested to SSE queue and schedule auto-expire."""
+                nonlocal _approval_notified, _current_approval_id
+                _approval_notified = True
+                import uuid as _uuid
+                approval_id = _uuid.uuid4().hex
+                _current_approval_id = approval_id
+                self._run_approval_session_keys[run_id] = _api_approval_session_key
+                self._run_approval_ids[(run_id, approval_id)] = _api_approval_session_key
+                self._approval_session_map[approval_id] = _api_approval_session_key
+
+                enriched = dict(approval_data)
+                enriched["id"] = approval_id
+                enriched["choices"] = ["once", "session", "always", "deny"]
+                try:
+                    from tools.approval import _get_approval_config
+                    enriched["timeout"] = _get_approval_config().get("gateway_timeout", 300)
+                except Exception:
+                    enriched["timeout"] = 300
+                event_cb(
+                    "approval.requested", "_approval", "",
+                    approval_data=enriched,
+                )
+
+                # Schedule auto-expire timer
+                _run_id_local = run_id
+                _approval_id_local = approval_id
+                _timeout_secs = enriched["timeout"]
+                _loop = loop
+
+                def _approval_expired():
+                    self._approval_timeout_handles.pop((_run_id_local, _approval_id_local), None)
+                    run_q = self._run_streams.get(_run_id_local)
+                    if run_q is not None:
+                        try:
+                            run_q.put_nowait({
+                                "event": "approval.resolved",
+                                "run_id": _run_id_local,
+                                "approval_id": _approval_id_local,
+                                "decision": "deny",
+                                "expired": True,
+                                "timestamp": time.time(),
+                            })
+                        except Exception:
+                            pass
+
+                handle = _loop.call_later(_timeout_secs, _approval_expired)
+                self._approval_timeout_handles[(_run_id_local, _approval_id_local)] = handle
+
+            # Set session context for Rails-originated runs so that tools
+            # (e.g. cronjob tool) can capture the origin and route cron
+            # deliveries back to the correct session.
+            _session_tokens = None
+            if isinstance(session_id, str) and session_id.startswith("rails-session-"):
+                _chat_id = session_id.removeprefix("rails-session-").strip()
+                if _chat_id:
+                    from gateway.session_context import set_session_vars
+                    _session_tokens = set_session_vars(
+                        platform="aziendaos",
+                        chat_id=_chat_id,
+                        session_key=f"aziendaos:{_chat_id}",
+                    )
+
             try:
                 self._set_run_status(run_id, "running")
+                # Define tool_complete_cb BEFORE _create_agent to avoid
+                # Python closure scoping error ("local variable referenced
+                # before assignment").
+                def _tool_complete_cb(tool_call_id: str, function_name: str, function_args: Any, function_result: str) -> None:
+                    """Emit artifact.created SSE event when attach_file completes."""
+                    if function_name == "attach_file":
+                        path = ""
+                        if isinstance(function_args, dict):
+                            path = str(function_args.get("path", ""))
+                        if not path:
+                            try:
+                                parsed = json.loads(function_result) if isinstance(function_result, str) else function_result
+                                if isinstance(parsed, dict):
+                                    path = str(parsed.get("path", ""))
+                            except Exception:
+                                pass
+                        if path:
+                            resolved = Path(path)
+                            if resolved.exists() and resolved.is_file():
+                                stat = resolved.stat()
+                                ctype = "application/octet-stream"
+                                try:
+                                    import mimetypes
+                                    guessed, _ = mimetypes.guess_type(str(resolved))
+                                    if guessed:
+                                        ctype = guessed
+                                except Exception:
+                                    pass
+                                try:
+                                    loop.call_soon_threadsafe(q.put_nowait, {
+                                        "event": "artifact.created",
+                                        "run_id": run_id,
+                                        "timestamp": time.time(),
+                                        "path": str(resolved),
+                                        "filename": resolved.name,
+                                        "content_type": ctype,
+                                        "byte_size": stat.st_size,
+                                    })
+                                except Exception:
+                                    pass
+
+                # Wire reasoning callback: forward actual reasoning deltas via SSE
+                # and mark that real reasoning was received (to skip fallback).
+                def _reasoning_cb(text: str) -> None:
+                    self._run_reasoning_callback_fired[run_id] = True
+                    try:
+                        loop.call_soon_threadsafe(q.put_nowait, {
+                            "event": "reasoning.available",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "text": text,
+                        })
+                    except Exception:
+                        pass
+
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    tool_complete_callback=_tool_complete_cb,
+                    reasoning_callback=_reasoning_cb,
                 )
                 self._active_run_agents[run_id] = agent
+
                 def _run_sync():
-                    effective_task_id = session_id or run_id
-                    r = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
+                    from tools.approval import (
+                        register_gateway_notify,
+                        set_current_session_key,
+                        reset_current_session_key,
+                        unregister_gateway_notify,
                     )
-                    u = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                    # Set env vars so tools/approval.py enables dangerous-command
+                    # detection and gateway approval flow (mirrors TUI gateway).
+                    _old_env = {
+                        "HERMES_GATEWAY_SESSION": os.environ.get("HERMES_GATEWAY_SESSION"),
+                        "HERMES_EXEC_ASK": os.environ.get("HERMES_EXEC_ASK"),
+                        "HERMES_INTERACTIVE": os.environ.get("HERMES_INTERACTIVE"),
                     }
-                    return r, u
+                    os.environ["HERMES_GATEWAY_SESSION"] = "1"
+                    os.environ["HERMES_EXEC_ASK"] = "1"
+                    os.environ["HERMES_INTERACTIVE"] = "1"
+                    _token = set_current_session_key(_api_approval_session_key)
+                    register_gateway_notify(_api_approval_session_key, _approval_notify_sync)
+                    try:
+                        effective_task_id = session_id or run_id
+                        r = agent.run_conversation(
+                            user_message=user_message,
+                            conversation_history=conversation_history,
+                            task_id=effective_task_id,
+                        )
+                        u = {
+                            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                        }
+                        return r, u
+                    finally:
+                        for _k, _v in _old_env.items():
+                            if _v is None:
+                                os.environ.pop(_k, None)
+                            else:
+                                os.environ[_k] = _v
+                        unregister_gateway_notify(_api_approval_session_key)
+                        reset_current_session_key(_token)
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -2633,6 +2986,24 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
+                # Clean up approval tracking for this run
+                self._run_approval_session_keys.pop(run_id, None)
+                stale_keys = [k for k in list(self._run_approval_ids) if k[0] == run_id]
+                for k in stale_keys:
+                    self._run_approval_ids.pop(k, None)
+                    self._approval_session_map.pop(k[1], None)
+                stale_timers = [k for k in list(self._approval_timeout_handles) if k[0] == run_id]
+                for k in stale_timers:
+                    handle = self._approval_timeout_handles.pop(k, None)
+                    if handle:
+                        handle.cancel()
+                # Clean up session context vars if they were set
+                if _session_tokens is not None:
+                    try:
+                        from gateway.session_context import clear_session_vars
+                        clear_session_vars(_session_tokens)
+                    except Exception:
+                        pass
 
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
@@ -2775,6 +3146,318 @@ class APIServerAdapter(BasePlatformAdapter):
             for run_id in stale_statuses:
                 self._run_statuses.pop(run_id, None)
 
+            # Clean up orphaned approval tracking data for finished runs
+            stale_approval_runs = [
+                run_id
+                for run_id in list(self._run_approval_session_keys.keys())
+                if run_id not in self._run_streams
+            ]
+            for run_id in stale_approval_runs:
+                self._run_approval_session_keys.pop(run_id, None)
+                stale_keys = [k for k in list(self._run_approval_ids) if k[0] == run_id]
+                for k in stale_keys:
+                    self._run_approval_ids.pop(k, None)
+                    self._approval_session_map.pop(k[1], None)
+
+    async def _handle_run_approval(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/approvals/{approval_id} — decide on a pending approval.
+
+        Body: {"decision": "once"|"session"|"always"|"deny"}
+
+        Calls resolve_gateway_approval to unblock the waiting agent thread.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        approval_id = request.match_info["approval_id"]
+
+        # Resolve session key from our mappings
+        session_key = self._run_approval_session_keys.get(run_id)
+        if session_key is None:
+            return web.json_response(
+                _openai_error(f"Run not found or no pending approvals: {run_id}",
+                              code="run_not_found"),
+                status=404,
+            )
+
+        # Validate the approval_id
+        if self._run_approval_ids.get((run_id, approval_id)) != session_key:
+            return web.json_response(
+                _openai_error(f"Approval not found: {approval_id}",
+                              code="approval_not_found"),
+                status=404,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        decision = body.get("decision", "").strip().lower()
+        if decision not in ("once", "session", "always", "deny"):
+            return web.json_response(
+                _openai_error(f"Invalid decision: {decision!r}. Must be one of: once, session, always, deny",
+                              code="invalid_decision"),
+                status=400,
+            )
+
+        from tools.approval import resolve_gateway_approval, has_blocking_approval
+
+        if not has_blocking_approval(session_key):
+            return web.json_response(
+                _openai_error("No pending approval for this session",
+                              code="no_pending_approval"),
+                status=409,
+            )
+
+        count = resolve_gateway_approval(session_key, decision)
+        if not count:
+            return web.json_response(
+                _openai_error("No pending command to approve",
+                              code="no_pending_approval"),
+                status=409,
+            )
+
+        # Clean up our mapping (keep session_key for the run in case more approvals arrive)
+        self._run_approval_ids.pop((run_id, approval_id), None)
+        self._approval_session_map.pop(approval_id, None)
+
+        # Cancel the auto-expire timer since the user responded
+        timer_handle = self._approval_timeout_handles.pop((run_id, approval_id), None)
+        if timer_handle is not None:
+            timer_handle.cancel()
+
+        # Push approval.resolved SSE event so the client knows the outcome
+        run_q = self._run_streams.get(run_id)
+        if run_q is not None:
+            try:
+                run_q.put_nowait({
+                    "event": "approval.resolved",
+                    "run_id": run_id,
+                    "approval_id": approval_id,
+                    "decision": decision,
+                    "expired": decision == "deny",
+                    "timestamp": time.time(),
+                })
+            except Exception:
+                pass
+
+        logger.info(
+            "[api_server] run %s approval %s: decision=%s",
+            run_id, approval_id, decision,
+        )
+        return web.json_response({
+            "run_id": run_id,
+            "status": "processed",
+            "decision": decision,
+        })
+
+    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id} — read-only session metadata and messages.
+
+        Query params:
+          resolved=true|false        default true  — follow parent→child chain
+          include=messages           default       — return messages
+          include=messages,tool_calls,reasoning    — return with extras
+          format=raw|conversation    default raw   — raw export or conversation format
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response(
+                _openai_error("Missing session_id"),
+                status=400,
+            )
+        # Sanitize: reject control characters
+        if re.search(r'[\r\n\x00]', session_id):
+            return web.json_response(
+                _openai_error("Invalid session ID"),
+                status=400,
+            )
+
+        resolved = request.query.get("resolved", "true").lower() == "true"
+        include_param = request.query.get("include", "messages")
+        format_param = request.query.get("format", "raw")
+
+        include_set = {s.strip() for s in include_param.split(",") if s.strip()}
+
+        try:
+            db = self._ensure_session_db()
+            if db is None:
+                return web.json_response(
+                    _openai_error("Session storage not available"),
+                    status=503,
+                )
+
+            resolved_session_id = session_id
+            if resolved:
+                # Use get_compression_tip to resolve to the active continuation
+                # after compression, not the stale root with old messages.
+                if hasattr(db, "get_compression_tip"):
+                    tip = db.get_compression_tip(session_id)
+                    if tip:
+                        resolved_session_id = tip
+                elif hasattr(db, "resolve_resume_session_id"):
+                    resolved_session_id = db.resolve_resume_session_id(session_id)
+
+            # Get session metadata
+            session_data = db.get_session(resolved_session_id)
+            if not session_data:
+                return web.json_response(
+                    _openai_error(f"Session not found: {session_id}"),
+                    status=404,
+                )
+
+            # Build response
+            compressed = resolved_session_id != session_id
+            lineage = [session_id]
+            if resolved_session_id != session_id:
+                lineage = [session_id, resolved_session_id]
+
+            # Determine if we have a compressed session by checking lineage length
+            # (a compressed session has a child in the parent→child chain)
+            if hasattr(db, "_session_lineage_root_to_tip"):
+                try:
+                    full_lineage = db._session_lineage_root_to_tip(resolved_session_id)
+                    if len(full_lineage) > 1:
+                        compressed = True
+                        lineage = full_lineage
+                except Exception:
+                    pass
+
+            response_data: Dict[str, Any] = {
+                "id": session_id,
+                "resolved_session_id": resolved_session_id,
+                "compressed": compressed,
+                "lineage": lineage,
+                "message_count": session_data.get("message_count", 0),
+                "tool_call_count": session_data.get("tool_call_count", 0),
+            }
+
+            # Include messages if requested
+            if "messages" in include_set or not include_set - {"messages", "tool_calls", "reasoning"}:
+                if format_param == "conversation":
+                    messages = db.get_messages_as_conversation(
+                        resolved_session_id,
+                        include_ancestors=True,
+                    )
+                else:
+                    export = db.export_session(resolved_session_id)
+                    messages = export.get("messages", []) if export else []
+
+                if not include_set.issuperset({"tool_calls"}):
+                    # Strip tool_calls from messages if not requested
+                    messages = [
+                        {k: v for k, v in msg.items() if k != "tool_calls"}
+                        for msg in messages
+                    ]
+                if "reasoning" not in include_set:
+                    messages = [
+                        {k: v for k, v in msg.items() if k not in ("reasoning", "reasoning_content", "reasoning_details")}
+                        for msg in messages
+                    ]
+
+                response_data["messages"] = messages
+
+            return web.json_response(response_data)
+
+        except Exception as e:
+            logger.warning("Failed to fetch session %s: %s", session_id, e)
+            return web.json_response(
+                _openai_error(f"Internal error: {e}"),
+                status=500,
+            )
+
+    async def _handle_file_read(self, request: "web.Request") -> "web.Response":
+        """GET /v1/files/read — serve a generated file by absolute path.
+
+        Protected by the same API key auth as other endpoints.
+        Path is validated to be within the generated files directory to
+        prevent path traversal.
+
+        Query params:
+          path (str) — absolute path to the file to read
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        file_path = request.query.get("path", "")
+        if not file_path:
+            return web.json_response(
+                _openai_error("Missing 'path' query parameter"),
+                status=400,
+            )
+
+        # Resolve and validate path — must be under generated files dir
+        try:
+            resolved = Path(file_path).resolve()
+            allowed = Path(self._generated_files_dir).resolve()
+            resolved.relative_to(allowed)
+        except (ValueError, RuntimeError):
+            return web.json_response(
+                _openai_error("Access denied"),
+                status=403,
+            )
+
+        if not resolved.exists() or not resolved.is_file():
+            return web.json_response(
+                _openai_error("File not found"),
+                status=404,
+            )
+
+        # Size limit
+        max_bytes = 100 * 1024 * 1024
+        if resolved.stat().st_size > max_bytes:
+            return web.json_response(
+                _openai_error("File too large"),
+                status=413,
+            )
+
+        return web.FileResponse(resolved)
+
+    async def _handle_file_download(self, request: "web.Request") -> "web.Response":
+        """GET /v1/files/{filename}/download — serve file with HMAC-signed URL.
+
+        Uses signed URLs (HMAC + expiration) instead of Bearer auth so
+        that browser clicks work without manual headers.
+
+        Query params:
+          expires (int) — Unix timestamp when the link expires
+          sig (str) — HMAC-SHA256(filename:expires, api_key)[:16]
+        """
+        filename = request.match_info.get("filename", "")
+        expires = request.query.get("expires", "")
+        sig = request.query.get("sig", "")
+        if not filename or not expires or not sig:
+            return web.json_response({"error": "Missing signature params"}, status=401)
+        if ".." in filename or "/" in filename:
+            return web.json_response({"error": "Invalid filename"}, status=400)
+        try:
+            exp_int = int(expires)
+            if time.time() > exp_int:
+                return web.json_response({"error": "Link expired"}, status=401)
+        except ValueError:
+            return web.json_response({"error": "Invalid expiration"}, status=400)
+        # Verify signature
+        expected_sig = hmac.new(self._api_key.encode(), f"{filename}:{expires}".encode(), hashlib.sha256).hexdigest()[:16]
+        if not hmac.compare_digest(expected_sig, sig):
+            return web.json_response({"error": "Invalid signature"}, status=403)
+        file_path = _SHARED_UPLOADS_DIR / filename
+        try:
+            file_path = file_path.resolve()
+            file_path.relative_to(_SHARED_UPLOADS_DIR.resolve())
+        except (ValueError, RuntimeError):
+            return web.json_response({"error": "Access denied"}, status=403)
+        if not file_path.exists() or not file_path.is_file():
+            return web.json_response({"error": "File not found"}, status=404)
+        return web.FileResponse(file_path)
+
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
     # ------------------------------------------------------------------
@@ -2812,6 +3495,12 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            self._app.router.add_post("/v1/runs/{run_id}/approvals/{approval_id}", self._handle_run_approval)
+            # AziendaOS extensions
+            self._app.router.add_get("/v1/sessions/{session_id}", self._handle_get_session)
+            self._app.router.add_get("/v1/files/read", self._handle_file_read)
+            # HMAC-signed file download for browser-side access
+            self._app.router.add_get("/v1/files/{filename}/download", self._handle_file_download)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

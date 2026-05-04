@@ -2195,3 +2195,120 @@ class TestSendMediaTimeoutCancelsFuture:
         # 2. Second file still got dispatched — one timeout doesn't abort the batch
         adapter.send_video.assert_called_once()
         assert adapter.send_video.call_args[1]["video_path"] == "/tmp/fast.mp4"
+
+
+class TestWebDelivery:
+    """Web delivery platform — cron result POSTs directly to the web UI."""
+
+    def test_web_in_known_platforms(self):
+        assert "web" in _KNOWN_DELIVERY_PLATFORMS
+
+    def test_resolve_delivery_target_returns_web_structure(self):
+        """Web deliver target resolves without needing env vars or origin."""
+        job = {
+            "id": "web-job",
+            "deliver": "web",
+        }
+        result = _resolve_delivery_target(job)
+        assert result is not None
+        assert result["platform"] == "web"
+        assert result["chat_id"] == "1"
+        assert result["thread_id"] is None
+
+    def test_deliver_result_posts_to_web_ui(self):
+        """_deliver_result POSTs JSON payload to the web UI URL."""
+        job = {
+            "id": "web-test-1",
+            "name": "daily-report",
+            "deliver": "web",
+        }
+        with patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen:
+            mock_response = MagicMock()
+            mock_response.status = 200
+            mock_urlopen.return_value = mock_response
+            mock_urlopen.return_value.__enter__.return_value = mock_response
+
+            result = _deliver_result(job, "Web delivery test content")
+
+        assert result is None  # None means success
+        mock_urlopen.assert_called_once()
+        args, kwargs = mock_urlopen.call_args
+        req = args[0] if args else kwargs.get("req")
+        assert req is not None
+        assert b"web-test-1" in req.data
+        assert b"Web delivery test content" in req.data
+
+    def test_deliver_result_uses_env_var_for_url(self):
+        """HERMES_WEB_UI_URL env var should override the default URL."""
+        custom_url = "https://myapp.example.com"
+        job = {
+            "id": "web-custom-url",
+            "deliver": "web",
+        }
+        with (
+            patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen,
+            patch.dict(os.environ, {"HERMES_WEB_UI_URL": custom_url}),
+        ):
+            mock_response = MagicMock()
+            mock_response.status = 200
+            mock_urlopen.return_value = mock_response
+            mock_urlopen.return_value.__enter__.return_value = mock_response
+
+            result = _deliver_result(job, "Content")
+
+        assert result is None
+        mock_urlopen.assert_called_once()
+        req = mock_urlopen.call_args[0][0]
+        assert custom_url in str(req.full_url) or custom_url in str(req.origin)
+
+    def test_deliver_result_handles_failure_gracefully(self):
+        """If web POST fails, _deliver_result returns an error message, doesn't crash."""
+        job = {
+            "id": "web-fail-job",
+            "deliver": "web",
+        }
+        with patch("urllib.request.urlopen", side_effect=ConnectionError("Network down")):
+            result = _deliver_result(job, "Content")
+
+        assert result is not None
+        assert "web delivery failed" in result
+        assert "Network down" in result
+
+    def test_deliver_result_with_origin_override(self):
+        """Web delivery with explicit origin override still goes through web path."""
+        job = {
+            "id": "web-origin-job",
+            "deliver": "web",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+        with patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen:
+            mock_response = MagicMock()
+            mock_response.status = 200
+            mock_urlopen.return_value = mock_response
+            mock_urlopen.return_value.__enter__.return_value = mock_response
+
+            result = _deliver_result(job, "Origin override test")
+
+        assert result is None
+        mock_urlopen.assert_called_once()
+
+    def test_deliver_result_sends_session_id_in_payload(self):
+        """The session_id from the resolved delivery target is sent in the JSON payload."""
+        job = {
+            "id": "web-session-job",
+            "deliver": "web",
+        }
+        with patch("urllib.request.urlopen", new=MagicMock()) as mock_urlopen:
+            mock_response = MagicMock()
+            mock_response.status = 200
+            mock_urlopen.return_value = mock_response
+            mock_urlopen.return_value.__enter__.return_value = mock_response
+
+            result = _deliver_result(job, "Check session_id")
+
+        assert result is None
+        req = mock_urlopen.call_args[0][0]
+        payload = json.loads(req.data.decode("utf-8"))
+        assert payload["job_id"] == "web-session-job"
+        assert payload["session_id"] == "1"
+        assert "Check session_id" in payload["content"]
