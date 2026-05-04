@@ -246,15 +246,6 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
     if platform_name.lower() not in _KNOWN_DELIVERY_PLATFORMS:
         return None
 
-    # web delivery doesn't use home target chat_id — it POSTs to the web app endpoint
-    if platform_name.lower() == "web":
-        chat_id = origin.get("chat_id", "1") if origin else "1"
-        return {
-            "platform": "web",
-            "chat_id": chat_id,
-            "thread_id": None,
-        }
-
     chat_id = _get_home_target_chat_id(platform_name)
     if not chat_id:
         return None
@@ -363,6 +354,54 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
+def _deliver_web(job: dict, content: str) -> Optional[str]:
+    """POST cron job output to the web UI endpoint.
+
+    Used for ``deliver=web`` cron jobs.  POSTs the raw content
+    (without wrapping or MEDIA stripping) as JSON to the configured
+    ``HERMES_WEB_UI_URL`` (default ``http://localhost:4000``).
+
+    Returns None on success, or an error string on failure.
+    """
+    web_ui_url = os.getenv("HERMES_WEB_UI_URL", "http://localhost:4000")
+    try:
+        import urllib.request, urllib.error
+
+        payload = json.dumps({
+            "job_id": job["id"],
+            "session_id": job["id"],
+            "content": content,
+        }).encode()
+        req = urllib.request.Request(
+            f"{web_ui_url}/api/cron_deliveries",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status >= 400:
+                raise urllib.error.HTTPError(
+                    resp.url, resp.status, resp.msg, resp.headers, None
+                )
+        logger.info("Job '%s': delivered to web UI", job["id"])
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            logger.warning(
+                "Job '%s': web delivery target not found; "
+                "the UI will auto-create it on next delivery",
+                job["id"],
+            )
+        else:
+            msg = f"web delivery failed: HTTP {e.code}"
+            logger.error("Job '%s': %s", job["id"], msg)
+            return msg
+    except Exception as e:
+        msg = f"web delivery failed: {e}"
+        logger.error("Job '%s': %s", job["id"], msg)
+        return msg
+    return None
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -374,6 +413,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    # Handle web delivery first — no platform adapter or target resolution needed
+    deliver = _normalize_deliver_value(job.get("deliver", "local"))
+    parts = [p.strip().lower() for p in deliver.split(",") if p.strip()]
+
+    # Extract "web" from delivery parts and handle it directly
+    has_web = "web" in parts
+    if has_web and all(p == "web" for p in parts):
+        # Only web delivery — skip target resolution entirely
+        return _deliver_web(job, content)
+
+    if has_web:
+        # Mixed: handle web first, then strip it for remaining targets
+        err = _deliver_web(job, content)
+        if err:
+            return err
+        # Strip "web" from deliver, keep remaining platforms
+        remaining = ",".join(p for p in parts if p != "web")
+        job = {**job, "deliver": remaining}
+
     targets = _resolve_delivery_targets(job)
     if not targets:
         if job.get("deliver", "local") != "local":
@@ -443,43 +501,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         # Built-in names resolve to their enum member; plugin platform names
         # create dynamic members via Platform._missing_().
-        # Handle web delivery: POST directly to the web UI endpoint
+        # Web delivery is handled before the target loop (see _deliver_web above).
+        # This branch is dead code for web — if it somehow reaches here, log and skip.
         if platform_name.lower() == "web":
-            web_ui_url = os.getenv("HERMES_WEB_UI_URL", "http://localhost:4000")
-            try:
-                import urllib.request, urllib.error
-                payload = json.dumps({
-                    "job_id": job["id"],
-                    "session_id": chat_id,
-                    "content": content,
-                }).encode()
-                req = urllib.request.Request(
-                    f"{web_ui_url}/api/cron_deliveries",
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    if resp.status >= 400:
-                        raise urllib.error.HTTPError(
-                            resp.url, resp.status, resp.msg, resp.headers, None
-                        )
-                logger.info("Job '%s': delivered to web UI (session %s)", job["id"], chat_id)
-            except urllib.error.HTTPError as e:
-                if e.code == 404:
-                    logger.warning(
-                        "Job '%s': web delivery target session %s not found; "
-                        "the UI will auto-create it on next delivery",
-                        job["id"], chat_id,
-                    )
-                else:
-                    msg = f"web delivery failed: HTTP {e.code}"
-                    logger.error("Job '%s': %s", job["id"], msg)
-                    delivery_errors.append(msg)
-            except Exception as e:
-                msg = f"web delivery failed: {e}"
-                logger.error("Job '%s': %s", job["id"], msg)
-                delivery_errors.append(msg)
+            logger.warning(
+                "Job '%s': web delivery hit loop target unexpectedly (deliver=%s)",
+                job["id"], job.get("deliver", "local"),
+            )
             continue
 
         try:

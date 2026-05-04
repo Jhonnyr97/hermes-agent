@@ -2203,18 +2203,6 @@ class TestWebDelivery:
     def test_web_in_known_platforms(self):
         assert "web" in _KNOWN_DELIVERY_PLATFORMS
 
-    def test_resolve_delivery_target_returns_web_structure(self):
-        """Web deliver target resolves without needing env vars or origin."""
-        job = {
-            "id": "web-job",
-            "deliver": "web",
-        }
-        result = _resolve_delivery_target(job)
-        assert result is not None
-        assert result["platform"] == "web"
-        assert result["chat_id"] == "1"
-        assert result["thread_id"] is None
-
     def test_deliver_result_posts_to_web_ui(self):
         """_deliver_result POSTs JSON payload to the web UI URL."""
         job = {
@@ -2310,5 +2298,5 @@ class TestWebDelivery:
         req = mock_urlopen.call_args[0][0]
         payload = json.loads(req.data.decode("utf-8"))
         assert payload["job_id"] == "web-session-job"
-        assert payload["session_id"] == "1"
+        assert payload["session_id"] == "web-session-job"
         assert "Check session_id" in payload["content"]
