@@ -412,11 +412,8 @@ def _deliver_web(job: dict, content: str) -> Optional[str]:
             headers=headers,
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            if resp.status >= 400:
-                raise urllib.error.HTTPError(
-                    resp.url, resp.status, resp.msg, resp.headers, None
-                )
+        with urllib.request.urlopen(req, timeout=15):
+            pass
         logger.info("Job '%s': delivered to web UI", job["id"])
     except urllib.error.HTTPError as e:
         msg = f"web delivery failed: HTTP {e.code}"
