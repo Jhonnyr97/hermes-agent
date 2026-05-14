@@ -80,7 +80,7 @@ RUN chmod -R a+rX /opt/hermes
 
 # ---------- Python virtualenv ----------
 RUN uv venv && \
-    uv pip install --no-cache-dir -e ".[all]"
+    uv pip install --no-cache-dir -e "."
 
 # ---------- AziendaOS extras ----------
 # Node.js libraries for Office skills (pptx, docx)
@@ -99,6 +99,12 @@ RUN bash -c 'chrome_path=$(find /opt/hermes/.playwright -name "headless_shell" -
 RUN mkdir -p /etc/profile.d && \
     echo 'export PATH="/opt/hermes/.venv/bin:$PATH"' > /etc/profile.d/hermes.sh && \
     echo 'export NODE_PATH="/opt/hermes/node_modules"' >> /etc/profile.d/hermes.sh
+
+# Hyperframes render browser: use Playwright's headless shell (supports
+# HeadlessExperimental.beginFrame for fast capture; zero extra deps since
+# Playwright is already installed above). chromium via apt also works but
+# adds ~200MB and falls back to slower screenshot capture mode.
+ENV PRODUCER_HEADLESS_SHELL_PATH=/opt/hermes/.playwright/chromium_headless_shell-1217/chrome-linux/headless_shell
 
 # ---------- Runtime ----------
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist

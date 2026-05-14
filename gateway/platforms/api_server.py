@@ -763,6 +763,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._approval_session_map: Dict[str, str] = {}
         # Approval tracking: (run_id, approval_id) → asyncio.TimerHandle for auto-expire
         self._approval_timeout_handles: Dict[tuple[str, str], "asyncio.TimerHandle"] = {}
+        # Clarify tracking: run_id → session_key
+        self._run_clarify_session_keys: Dict[str, str] = {}
+        # Clarify tracking: (run_id, clarify_id) → session_key
+        self._run_clarify_ids: Dict[tuple[str, str], str] = {}
+        # Clarify tracking: clarify_id → session_key
+        self._clarify_session_map: Dict[str, str] = {}
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -886,6 +892,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         reasoning_callback=None,
+        clarify_web_session_key: str = "",
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -930,6 +937,7 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             reasoning_callback=reasoning_callback,
+            clarify_web_session_key=clarify_web_session_key,
         )
         return agent
 
@@ -2632,6 +2640,27 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timeout": approval_data.get("timeout", 300),
                     "expires_at": approval_data.get("expires_at"),
                 })
+            elif event_type == "clarify.requested":
+                clarify_data = kwargs.get("clarify_data") or {}
+                _push({
+                    "event": "clarify.requested",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "clarify_id": clarify_data.get("id", ""),
+                    "question": clarify_data.get("question", ""),
+                    "choices": clarify_data.get("choices", []),
+                    "timeout": clarify_data.get("timeout", 300),
+                    "expires_at": ts + clarify_data.get("timeout", 300),
+                })
+            elif event_type == "clarify.resolved":
+                clarify_data = kwargs.get("clarify_data") or {}
+                _push({
+                    "event": "clarify.resolved",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "clarify_id": clarify_data.get("clarify_id", ""),
+                    "response": clarify_data.get("response", ""),
+                })
             # _thinking and subagent_progress are intentionally not forwarded
 
         return _callback
@@ -2770,6 +2799,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         async def _run_and_close():
             _api_approval_session_key = f"api-session-{session_id}"
+            _api_clarify_session_key = f"api-session-{session_id}"
             _approval_notified = False
             _current_approval_id = None
 
@@ -2836,6 +2866,26 @@ class APIServerAdapter(BasePlatformAdapter):
                         session_key=f"aziendaos:{_chat_id}",
                     )
 
+            # Clarify notify: when the agent calls clarify_web, push an
+            # SSE event and block until the user responds via HTTP.
+            def _clarify_notify_sync(question: str, choices: list[str]) -> None:
+                """Push clarify.requested to SSE queue."""
+                import uuid as _uuid
+                clarify_id = _uuid.uuid4().hex
+                self._run_clarify_session_keys[run_id] = _api_clarify_session_key
+                self._run_clarify_ids[(run_id, clarify_id)] = _api_clarify_session_key
+                self._clarify_session_map[clarify_id] = _api_clarify_session_key
+
+                event_cb(
+                    "clarify.requested", "_clarify", "",
+                    clarify_data={
+                        "id": clarify_id,
+                        "question": question,
+                        "choices": choices,
+                        "timeout": 300,
+                    },
+                )
+
             try:
                 self._set_run_status(run_id, "running")
                 # Define tool_complete_cb BEFORE _create_agent to avoid
@@ -2900,6 +2950,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=event_cb,
                     tool_complete_callback=_tool_complete_cb,
                     reasoning_callback=_reasoning_cb,
+                    clarify_web_session_key=_api_clarify_session_key,
                 )
                 self._active_run_agents[run_id] = agent
 
@@ -2909,6 +2960,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         set_current_session_key,
                         reset_current_session_key,
                         unregister_gateway_notify,
+                    )
+                    from tools.clarify_gateway import (
+                        register_clarify_notify,
+                        unregister_clarify_notify,
                     )
                     # Set env vars so tools/approval.py enables dangerous-command
                     # detection and gateway approval flow (mirrors TUI gateway).
@@ -2922,6 +2977,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     os.environ["HERMES_INTERACTIVE"] = "1"
                     _token = set_current_session_key(_api_approval_session_key)
                     register_gateway_notify(_api_approval_session_key, _approval_notify_sync)
+                    register_clarify_notify(_api_clarify_session_key, _clarify_notify_sync)
                     try:
                         effective_task_id = session_id or run_id
                         r = agent.run_conversation(
@@ -2942,6 +2998,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             else:
                                 os.environ[_k] = _v
                         unregister_gateway_notify(_api_approval_session_key)
+                        unregister_clarify_notify(_api_clarify_session_key)
                         reset_current_session_key(_token)
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
@@ -3011,7 +3068,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     handle = self._approval_timeout_handles.pop(k, None)
                     if handle:
                         handle.cancel()
-                # Clean up session context vars if they were set
+                # Clean up clarify tracking for this run
+                self._run_clarify_session_keys.pop(run_id, None)
+                stale_clarify = [k for k in list(self._run_clarify_ids) if k[0] == run_id]
+                for k in stale_clarify:
+                    self._run_clarify_ids.pop(k, None)
+                    self._clarify_session_map.pop(k[1], None)
+                # Clean up session context vars
                 if _session_tokens is not None:
                     try:
                         from gateway.session_context import clear_session_vars
@@ -3173,6 +3236,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._run_approval_ids.pop(k, None)
                     self._approval_session_map.pop(k[1], None)
 
+            # Sweep orphaned clarify tracking
+            stale_clarify_runs = [
+                run_id
+                for run_id in list(self._run_clarify_session_keys.keys())
+                if run_id not in self._run_streams
+            ]
+            for run_id in stale_clarify_runs:
+                self._run_clarify_session_keys.pop(run_id, None)
+                stale_keys = [k for k in list(self._run_clarify_ids) if k[0] == run_id]
+                for k in stale_keys:
+                    self._run_clarify_ids.pop(k, None)
+                    self._clarify_session_map.pop(k[1], None)
+
     async def _handle_run_approval(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/approvals/{approval_id} — decide on a pending approval.
 
@@ -3266,6 +3342,87 @@ class APIServerAdapter(BasePlatformAdapter):
             "run_id": run_id,
             "status": "processed",
             "decision": decision,
+        })
+
+    async def _handle_clarify_response(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/clarify/{clarify_id} — user responded to a clarify question."""
+        run_id = request.match_info["run_id"]
+        clarify_id = request.match_info["clarify_id"]
+
+        session_key = self._run_clarify_session_keys.get(run_id)
+        if session_key is None:
+            return web.json_response(
+                _openai_error("No active session for this run",
+                              code="session_not_found"),
+                status=404,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Invalid JSON body"),
+                status=400,
+            )
+
+        response = body.get("response", "").strip()
+        if not response:
+            return web.json_response(
+                _openai_error("response is required"),
+                status=400,
+            )
+
+        # Validate clarify_id matches
+        if self._run_clarify_ids.get((run_id, clarify_id)) != session_key:
+            return web.json_response(
+                _openai_error(f"Clarify not found: {clarify_id}",
+                              code="clarify_not_found"),
+                status=404,
+            )
+
+        from tools.clarify_gateway import resolve_clarify, has_pending_clarify
+
+        if not has_pending_clarify(session_key):
+            return web.json_response(
+                _openai_error("No pending clarify question for this session",
+                              code="no_pending_clarify"),
+                status=409,
+            )
+
+        resolved = resolve_clarify(session_key, response)
+        if not resolved:
+            return web.json_response(
+                _openai_error("No pending clarify question to resolve",
+                              code="no_pending_clarify"),
+                status=409,
+            )
+
+        # Clean up mapping
+        self._run_clarify_ids.pop((run_id, clarify_id), None)
+        self._clarify_session_map.pop(clarify_id, None)
+
+        # Push clarify.resolved SSE event
+        run_q = self._run_streams.get(run_id)
+        if run_q is not None:
+            try:
+                run_q.put_nowait({
+                    "event": "clarify.resolved",
+                    "run_id": run_id,
+                    "clarify_id": clarify_id,
+                    "response": response,
+                    "timestamp": time.time(),
+                })
+            except Exception:
+                pass
+
+        logger.info(
+            "[api_server] run %s clarify %s: response=%s",
+            run_id, clarify_id, response[:60],
+        )
+        return web.json_response({
+            "run_id": run_id,
+            "status": "processed",
+            "response": response,
         })
 
     async def _handle_get_session(self, request: "web.Request") -> "web.Response":
@@ -3382,6 +3539,164 @@ class APIServerAdapter(BasePlatformAdapter):
 
         except Exception as e:
             logger.warning("Failed to fetch session %s: %s", session_id, e)
+            return web.json_response(
+                _openai_error(f"Internal error: {e}"),
+                status=500,
+            )
+
+    async def _handle_create_session(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions — create a new session with optional parent_session_id.
+
+        Body:
+          session_id (str, required) — the session identifier
+          parent_session_id (str, optional) — link to parent session for context chain
+          source (str, optional) — session source label (default: "api_server")
+          model (str, optional) — model identifier
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Invalid JSON body"),
+                status=400,
+            )
+
+        session_id = body.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response(
+                _openai_error("Missing required field: session_id"),
+                status=400,
+            )
+        if re.search(r'[\r\n\x00]', session_id):
+            return web.json_response(
+                _openai_error("Invalid session_id"),
+                status=400,
+            )
+
+        try:
+            db = self._ensure_session_db()
+            if db is None:
+                return web.json_response(
+                    _openai_error("Session storage not available"),
+                    status=503,
+                )
+
+            db.create_session(
+                session_id,
+                source=body.get("source", "api_server"),
+                parent_session_id=body.get("parent_session_id"),
+                model=body.get("model"),
+            )
+            return web.json_response(
+                {"id": session_id, "status": "created"},
+                status=201,
+            )
+        except Exception as e:
+            logger.warning("Failed to create session %s: %s", session_id, e)
+            return web.json_response(
+                _openai_error(f"Internal error: {e}"),
+                status=500,
+            )
+
+    async def _handle_replace_messages(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/messages/replace
+
+        Atomically replace all messages for a session (and its ancestor chain).
+
+        Body:
+          messages (list) — array of message dicts with at least "role" and "content"
+
+        This is the single write primitive for transcript-rewrite flows:
+        undo, retry, edit, truncate, reset — all built on top by reading
+        the current transcript (GET …/session), modifying it client-side,
+        then POSTing the result here.
+
+        Uses SessionDB.replace_messages() which wraps delete+reinsert in a
+        single transaction.  Ancestor sessions (from compression) are cleaned
+        so stale messages never reappear on subsequent reads.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response(
+                _openai_error("Missing session_id"),
+                status=400,
+            )
+        if re.search(r'[\r\n\x00]', session_id):
+            return web.json_response(
+                _openai_error("Invalid session ID"),
+                status=400,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Invalid JSON body"),
+                status=400,
+            )
+
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return web.json_response(
+                _openai_error("'messages' must be a non-empty array"),
+                status=400,
+            )
+
+        try:
+            db = self._ensure_session_db()
+            if db is None:
+                return web.json_response(
+                    _openai_error("Session storage not available"),
+                    status=503,
+                )
+
+            active = db.resolve_resume_session_id(session_id)
+
+            # Ensure the target session exists in the sessions table
+            # so replace_messages' FOREIGN KEY constraint doesn't fail.
+            existing = db.get_session(active)
+            if existing is None:
+                db._conn.execute(
+                    """INSERT OR IGNORE INTO sessions
+                       (id, source, started_at, message_count, tool_call_count)
+                       VALUES (?, 'api_server', ?, 0, 0)""",
+                    (active, time.time()),
+                )
+
+            # Clean ancestor sessions so stale messages don't reappear
+            # on reads that use include_ancestors=True.
+            chain = db._session_lineage_root_to_tip(session_id)
+            for sid in chain[:-1]:
+                db._conn.execute(
+                    "DELETE FROM messages WHERE session_id = ?", (sid,)
+                )
+                db._conn.execute(
+                    "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
+                    (sid,),
+                )
+
+            db.replace_messages(active, messages)
+
+            return web.json_response({
+                "status": "ok",
+                "session_id": session_id,
+                "active_session_id": active,
+                "message_count": len(messages),
+                "ancestors_cleaned": len(chain) - 1,
+            })
+
+        except Exception as e:
+            logger.warning(
+                "replace_messages failed for session %s: %s", session_id, e,
+            )
             return web.json_response(
                 _openai_error(f"Internal error: {e}"),
                 status=500,
@@ -3510,8 +3825,14 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
             self._app.router.add_post("/v1/runs/{run_id}/approvals/{approval_id}", self._handle_run_approval)
+            self._app.router.add_post("/v1/runs/{run_id}/clarify/{clarify_id}", self._handle_clarify_response)
             # AziendaOS extensions
             self._app.router.add_get("/v1/sessions/{session_id}", self._handle_get_session)
+            self._app.router.add_post("/v1/sessions", self._handle_create_session)
+            self._app.router.add_post(
+                "/v1/sessions/{session_id}/messages/replace",
+                self._handle_replace_messages,
+            )
             self._app.router.add_get("/v1/files/read", self._handle_file_read)
             # HMAC-signed file download for browser-side access
             self._app.router.add_get("/v1/files/{filename}/download", self._handle_file_download)

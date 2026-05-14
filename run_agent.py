@@ -927,6 +927,7 @@ class AIAgent:
         thinking_callback: callable = None,
         reasoning_callback: callable = None,
         clarify_callback: callable = None,
+        clarify_web_session_key: str = "",
         step_callback: callable = None,
         stream_delta_callback: callable = None,
         interim_assistant_callback: callable = None,
@@ -984,6 +985,7 @@ class AIAgent:
             tool_progress_callback (callable): Callback function(tool_name, args_preview) for progress notifications
             clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
                 Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
+            clarify_web_session_key (str): Session key for the clarify_web tool (gateway/API server mode).
             max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
             reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
                 If None, defaults to {"enabled": True, "effort": "medium"} for OpenRouter. Set to disable/customize reasoning.
@@ -1147,6 +1149,7 @@ class AIAgent:
         self.thinking_callback = thinking_callback
         self.reasoning_callback = reasoning_callback
         self.clarify_callback = clarify_callback
+        self.clarify_web_session_key = clarify_web_session_key
         self.step_callback = step_callback
         self.stream_delta_callback = stream_delta_callback
         self.interim_assistant_callback = interim_assistant_callback
@@ -9361,6 +9364,13 @@ class AIAgent:
                 choices=function_args.get("choices"),
                 callback=self.clarify_callback,
             )
+        elif function_name == "clarify_web":
+            from tools.clarify_web_tool import clarify_web_tool as _clarify_web_tool
+            return _clarify_web_tool(
+                question=function_args.get("question", ""),
+                choices=function_args.get("choices"),
+                session_key=self.clarify_web_session_key,
+            )
         elif function_name == "delegate_task":
             return self._dispatch_delegate_task(function_args)
         else:
@@ -9968,6 +9978,16 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+            elif function_name == "clarify_web":
+                from tools.clarify_web_tool import clarify_web_tool as _clarify_web_tool
+                function_result = _clarify_web_tool(
+                    question=function_args.get("question", ""),
+                    choices=function_args.get("choices"),
+                    session_key=self.clarify_web_session_key,
+                )
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  {_get_cute_tool_message_impl('clarify_web', function_args, tool_duration, result=function_result)}")
             elif function_name == "delegate_task":
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):

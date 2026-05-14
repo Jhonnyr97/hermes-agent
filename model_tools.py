@@ -238,7 +238,7 @@ _LEGACY_TOOLSET_MAP = {
         "rl_stop_training", "rl_get_results",
         "rl_list_runs", "rl_test_inference"
     ],
-    "file_tools": ["read_file", "write_file", "patch", "search_files"],
+    "file_tools": ["read_file", "write_file", "patch", "search_files", "attach_file"],
     "tts_tools": ["text_to_speech"],
 }
 

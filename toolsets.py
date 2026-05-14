@@ -157,8 +157,8 @@ TOOLSETS = {
     },
     
     "file": {
-        "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
-        "tools": ["read_file", "write_file", "patch", "search_files"],
+        "description": "File manipulation tools: read, write, patch (with fuzzy matching), search (content + files), and attach (mark for download via web UI)",
+        "tools": ["read_file", "write_file", "patch", "search_files", "attach_file"],
         "includes": []
     },
     
@@ -191,7 +191,13 @@ TOOLSETS = {
         "tools": ["clarify"],
         "includes": []
     },
-    
+
+    "clarify_web": {
+        "description": "Ask the user clarifying questions via Web UI (Rails). Blocks until user responds in the browser.",
+        "tools": ["clarify_web"],
+        "includes": []
+    },
+
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
         "tools": ["execute_code"],
@@ -321,7 +327,7 @@ TOOLSETS = {
     },
 
     "hermes-api-server": {
-        "description": "OpenAI-compatible API server — full agent tools accessible via HTTP (no interactive UI tools like clarify or send_message)",
+        "description": "OpenAI-compatible API server — full agent tools accessible via HTTP (no interactive UI tools like send_message)",
         "tools": [
             # Web
             "web_search", "web_extract",
@@ -338,6 +344,8 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+            # Clarifying questions via Web UI
+            "clarify_web",
             # Planning & memory
             "todo", "memory",
             # Session history search
