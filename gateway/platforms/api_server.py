@@ -3544,6 +3544,119 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
 
+    @staticmethod
+    def _runtime_prompt_sources(
+        *,
+        configured_system_prompt: str,
+        display_personality: str,
+        assembled_system_prompt: str,
+    ) -> List[str]:
+        sources: List[str] = ["core"]
+        if configured_system_prompt:
+            sources.append("config.agent.system_prompt")
+        if display_personality:
+            sources.append("config.display.personality")
+        if assembled_system_prompt:
+            sources.append("runtime.assembled")
+        return sources
+
+    async def _handle_get_session_runtime(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id}/runtime — runtime metadata for external UIs."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response(
+                _openai_error("Missing session_id"),
+                status=400,
+            )
+        if re.search(r'[\r\n\x00]', session_id):
+            return web.json_response(
+                _openai_error("Invalid session ID"),
+                status=400,
+            )
+
+        resolved = request.query.get("resolved", "true").lower() == "true"
+
+        try:
+            db = self._ensure_session_db()
+            if db is None:
+                return web.json_response(
+                    _openai_error("Session storage not available"),
+                    status=503,
+                )
+
+            resolved_session_id = session_id
+            if resolved:
+                if hasattr(db, "get_compression_tip"):
+                    tip = db.get_compression_tip(session_id)
+                    if tip:
+                        resolved_session_id = tip
+                elif hasattr(db, "resolve_resume_session_id"):
+                    resolved_session_id = db.resolve_resume_session_id(session_id)
+
+            session_data = db.get_session(resolved_session_id)
+            if not session_data:
+                return web.json_response(
+                    _openai_error(f"Session not found: {session_id}"),
+                    status=404,
+                )
+
+            from gateway.run import _load_gateway_config, _resolve_gateway_model
+
+            cfg = _load_gateway_config()
+            model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+            display_cfg = cfg.get("display", {}) if isinstance(cfg, dict) else {}
+            agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+
+            if isinstance(model_cfg, dict):
+                configured_model = str(model_cfg.get("default", model_cfg.get("name", "")) or "")
+                configured_provider = str(model_cfg.get("provider", "") or "")
+                configured_base_url = str(model_cfg.get("base_url", "") or "")
+            else:
+                configured_model = str(model_cfg or "")
+                configured_provider = ""
+                configured_base_url = ""
+
+            configured_system_prompt = str(agent_cfg.get("system_prompt", "") or "")
+            display_personality = str(display_cfg.get("personality", "") or "")
+            assembled_system_prompt = str(session_data.get("system_prompt", "") or "")
+            stored_session_model = str(session_data.get("model", "") or "")
+            effective_model = stored_session_model or str(_resolve_gateway_model() or configured_model or "")
+            effective_provider = configured_provider
+            if effective_model == configured_model == "openrouter/auto":
+                effective_model = ""
+
+            response_data: Dict[str, Any] = {
+                "object": "hermes.session.runtime",
+                "id": session_id,
+                "resolved_session_id": resolved_session_id,
+                "runtime_controlled_by": "hermes",
+                "advertised_model": self._model_name,
+                "configured_model": configured_model,
+                "configured_provider": configured_provider,
+                "configured_base_url": configured_base_url,
+                "effective_model": effective_model,
+                "effective_provider": effective_provider,
+                "display_personality": display_personality,
+                "configured_system_prompt": configured_system_prompt,
+                "assembled_system_prompt": assembled_system_prompt,
+                "prompt_sources": self._runtime_prompt_sources(
+                    configured_system_prompt=configured_system_prompt,
+                    display_personality=display_personality,
+                    assembled_system_prompt=assembled_system_prompt,
+                ),
+            }
+            return web.json_response(response_data)
+        except Exception as e:
+            logger.warning("Failed to fetch runtime metadata for session %s: %s", session_id, e)
+            return web.json_response(
+                _openai_error(f"Internal error: {e}"),
+                status=500,
+            )
+
     async def _handle_create_session(self, request: "web.Request") -> "web.Response":
         """POST /v1/sessions — create a new session with optional parent_session_id.
 
@@ -3828,6 +3941,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs/{run_id}/clarify/{clarify_id}", self._handle_clarify_response)
             # AziendaOS extensions
             self._app.router.add_get("/v1/sessions/{session_id}", self._handle_get_session)
+            self._app.router.add_get("/v1/sessions/{session_id}/runtime", self._handle_get_session_runtime)
             self._app.router.add_post("/v1/sessions", self._handle_create_session)
             self._app.router.add_post(
                 "/v1/sessions/{session_id}/messages/replace",

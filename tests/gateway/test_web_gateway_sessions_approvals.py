@@ -60,6 +60,7 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_get("/v1/sessions/{session_id}", adapter._handle_get_session)
+    app.router.add_get("/v1/sessions/{session_id}/runtime", adapter._handle_get_session_runtime)
     return app
 
 
@@ -320,6 +321,54 @@ class TestGetSession:
                 body = await resp.json()
                 assert body["lineage"] == ["root", "parent", "child"]
                 assert body["compressed"] is True
+
+
+class TestGetSessionRuntime:
+    @pytest.mark.asyncio
+    async def test_runtime_metadata_returns_configured_and_effective_fields(self, adapter):
+        db = _mock_session_db(session_data={
+            "message_count": 5,
+            "tool_call_count": 2,
+            "model": "anthropic/claude-sonnet-4",
+            "system_prompt": "assembled runtime prompt",
+        })
+        app = _create_session_app(adapter)
+        cfg = {
+            "model": {
+                "default": "openrouter/auto",
+                "provider": "openrouter",
+                "base_url": "",
+            },
+            "agent": {
+                "system_prompt": "global config prompt",
+            },
+            "display": {
+                "personality": "helpful",
+            },
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_ensure_session_db", return_value=db),
+                patch("gateway.run._load_gateway_config", return_value=cfg),
+                patch("gateway.run._resolve_gateway_model", return_value="openrouter/auto"),
+            ):
+                resp = await cli.get("/v1/sessions/test-session-42/runtime")
+                assert resp.status == 200
+                body = await resp.json()
+
+        assert body["object"] == "hermes.session.runtime"
+        assert body["id"] == "test-session-42"
+        assert body["runtime_controlled_by"] == "hermes"
+        assert body["advertised_model"] == "hermes-agent"
+        assert body["configured_model"] == "openrouter/auto"
+        assert body["configured_provider"] == "openrouter"
+        assert body["effective_model"] == "anthropic/claude-sonnet-4"
+        assert body["display_personality"] == "helpful"
+        assert body["configured_system_prompt"] == "global config prompt"
+        assert body["assembled_system_prompt"] == "assembled runtime prompt"
+        assert "config.agent.system_prompt" in body["prompt_sources"]
+        assert "runtime.assembled" in body["prompt_sources"]
 
 
 # ===========================================================================
