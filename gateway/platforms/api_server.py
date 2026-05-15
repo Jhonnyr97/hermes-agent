@@ -3510,8 +3510,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_call_count": session_data.get("tool_call_count", 0),
             }
 
+            if "runtime" in include_set:
+                response_data["runtime"] = self._build_session_runtime_metadata(
+                    session_id=session_id,
+                    resolved_session_id=resolved_session_id,
+                    session_data=session_data,
+                )
+
             # Include messages if requested
-            if "messages" in include_set or not include_set - {"messages", "tool_calls", "reasoning"}:
+            if "messages" in include_set or not include_set - {"messages", "tool_calls", "reasoning", "runtime"}:
                 if format_param == "conversation":
                     messages = db.get_messages_as_conversation(
                         resolved_session_id,
@@ -3560,6 +3567,59 @@ class APIServerAdapter(BasePlatformAdapter):
             sources.append("runtime.assembled")
         return sources
 
+    def _build_session_runtime_metadata(
+        self,
+        *,
+        session_id: str,
+        resolved_session_id: str,
+        session_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        from gateway.run import _load_gateway_config, _resolve_gateway_model
+
+        cfg = _load_gateway_config()
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        display_cfg = cfg.get("display", {}) if isinstance(cfg, dict) else {}
+        agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+
+        if isinstance(model_cfg, dict):
+            configured_model = str(model_cfg.get("default", model_cfg.get("name", "")) or "")
+            configured_provider = str(model_cfg.get("provider", "") or "")
+            configured_base_url = str(model_cfg.get("base_url", "") or "")
+        else:
+            configured_model = str(model_cfg or "")
+            configured_provider = ""
+            configured_base_url = ""
+
+        configured_system_prompt = str(agent_cfg.get("system_prompt", "") or "")
+        display_personality = str(display_cfg.get("personality", "") or "")
+        assembled_system_prompt = str(session_data.get("system_prompt", "") or "")
+        stored_session_model = str(session_data.get("model", "") or "")
+        effective_model = stored_session_model or str(_resolve_gateway_model() or configured_model or "")
+        effective_provider = configured_provider
+        if effective_model == configured_model == "openrouter/auto":
+            effective_model = ""
+
+        return {
+            "object": "hermes.session.runtime",
+            "id": session_id,
+            "resolved_session_id": resolved_session_id,
+            "runtime_controlled_by": "hermes",
+            "advertised_model": self._model_name,
+            "configured_model": configured_model,
+            "configured_provider": configured_provider,
+            "configured_base_url": configured_base_url,
+            "effective_model": effective_model,
+            "effective_provider": effective_provider,
+            "display_personality": display_personality,
+            "configured_system_prompt": configured_system_prompt,
+            "assembled_system_prompt": assembled_system_prompt,
+            "prompt_sources": self._runtime_prompt_sources(
+                configured_system_prompt=configured_system_prompt,
+                display_personality=display_personality,
+                assembled_system_prompt=assembled_system_prompt,
+            ),
+        }
+
     async def _handle_get_session_runtime(self, request: "web.Request") -> "web.Response":
         """GET /v1/sessions/{session_id}/runtime — runtime metadata for external UIs."""
         auth_err = self._check_auth(request)
@@ -3604,51 +3664,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=404,
                 )
 
-            from gateway.run import _load_gateway_config, _resolve_gateway_model
-
-            cfg = _load_gateway_config()
-            model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
-            display_cfg = cfg.get("display", {}) if isinstance(cfg, dict) else {}
-            agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
-
-            if isinstance(model_cfg, dict):
-                configured_model = str(model_cfg.get("default", model_cfg.get("name", "")) or "")
-                configured_provider = str(model_cfg.get("provider", "") or "")
-                configured_base_url = str(model_cfg.get("base_url", "") or "")
-            else:
-                configured_model = str(model_cfg or "")
-                configured_provider = ""
-                configured_base_url = ""
-
-            configured_system_prompt = str(agent_cfg.get("system_prompt", "") or "")
-            display_personality = str(display_cfg.get("personality", "") or "")
-            assembled_system_prompt = str(session_data.get("system_prompt", "") or "")
-            stored_session_model = str(session_data.get("model", "") or "")
-            effective_model = stored_session_model or str(_resolve_gateway_model() or configured_model or "")
-            effective_provider = configured_provider
-            if effective_model == configured_model == "openrouter/auto":
-                effective_model = ""
-
-            response_data: Dict[str, Any] = {
-                "object": "hermes.session.runtime",
-                "id": session_id,
-                "resolved_session_id": resolved_session_id,
-                "runtime_controlled_by": "hermes",
-                "advertised_model": self._model_name,
-                "configured_model": configured_model,
-                "configured_provider": configured_provider,
-                "configured_base_url": configured_base_url,
-                "effective_model": effective_model,
-                "effective_provider": effective_provider,
-                "display_personality": display_personality,
-                "configured_system_prompt": configured_system_prompt,
-                "assembled_system_prompt": assembled_system_prompt,
-                "prompt_sources": self._runtime_prompt_sources(
-                    configured_system_prompt=configured_system_prompt,
-                    display_personality=display_personality,
-                    assembled_system_prompt=assembled_system_prompt,
-                ),
-            }
+            response_data = self._build_session_runtime_metadata(
+                session_id=session_id,
+                resolved_session_id=resolved_session_id,
+                session_data=session_data,
+            )
             return web.json_response(response_data)
         except Exception as e:
             logger.warning("Failed to fetch runtime metadata for session %s: %s", session_id, e)
