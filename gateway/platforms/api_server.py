@@ -3873,8 +3873,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=404,
             )
 
-        # Size limit
-        max_bytes = 100 * 1024 * 1024
+        # Size limit. Rails uses this endpoint to retrieve attach_file artifacts;
+        # generated videos can be larger than the former 100 MB cap.
+        max_bytes = 1024 * 1024 * 1024
         if resolved.stat().st_size > max_bytes:
             return web.json_response(
                 _openai_error("File too large"),

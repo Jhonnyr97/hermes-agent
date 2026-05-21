@@ -530,3 +530,18 @@ class TestHandleFileRead:
             assert resp.status == 200
             body = await resp.read()
             assert body == b"File content for download"
+
+    @pytest.mark.asyncio
+    async def test_file_larger_than_former_100mb_limit_returns_200(self, adapter, tmp_path):
+        """Files above 100 MB but below 1 GB should be downloadable by Rails."""
+        app = _make_file_app(adapter)
+        adapter._generated_files_dir = str(tmp_path)
+
+        test_file = tmp_path / "video.mp4"
+        former_limit_plus_one = (100 * 1024 * 1024) + 1
+        with test_file.open("wb") as f:
+            f.truncate(former_limit_plus_one)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(f"/v1/files/read?path={test_file}")
+            assert resp.status == 200
