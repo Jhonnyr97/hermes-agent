@@ -26,10 +26,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - forks/hermes-agent/**
-      - scripts/incus/build-hermes-image.sh
-      - .github/workflows/hermes-incus-image.yml
 
 permissions:
   contents: write
