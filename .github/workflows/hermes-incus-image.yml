@@ -1,0 +1,92 @@
+name: Hermes Incus image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: Incus image name and GitHub release asset prefix.
+        required: true
+        default: hermes
+      release:
+        description: Ubuntu release used for the Incus image rootfs.
+        required: true
+        default: noble
+      architecture:
+        description: Incus image architecture metadata.
+        required: true
+        default: x86_64
+        type: choice
+        options:
+          - x86_64
+      publish_release:
+        description: Publish image files to a GitHub Release.
+        required: true
+        default: true
+        type: boolean
+  push:
+    branches:
+      - main
+    paths:
+      - forks/hermes-agent/**
+      - scripts/incus/build-hermes-image.sh
+      - .github/workflows/hermes-incus-image.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and publish Hermes image
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      IMAGE_NAME: ${{ inputs.image_name || 'hermes' }}
+      RELEASE: ${{ inputs.release || 'noble' }}
+      ARCHITECTURE: ${{ inputs.architecture || 'x86_64' }}
+      HERMES_GIT_REF: ${{ github.sha }}
+      INCUS_HOST: ${{ secrets.INCUS_HOST }}
+      INCUS_USER: ${{ secrets.INCUS_USER }}
+      INCUS_SSH_KEY: ${{ secrets.INCUS_SSH_KEY }}
+      INCUS_PROJECT: ${{ vars.INCUS_PROJECT || 'default' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build Incus image files
+        run: scripts/incus/build-hermes-image.sh
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IMAGE_NAME }}-${{ github.sha }}-incus
+          path: dist/incus/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: ${{ github.event_name == 'push' || inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.IMAGE_NAME }}-${{ github.sha }}
+          name: ${{ env.IMAGE_NAME }} ${{ github.sha }}
+          files: dist/incus/*
+          make_latest: false
+
+      - name: Import image on production Incus host
+        if: ${{ env.INCUS_HOST != '' && env.INCUS_SSH_KEY != '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$INCUS_SSH_KEY" > ~/.ssh/incus_key
+          chmod 600 ~/.ssh/incus_key
+          SSH_USER="${INCUS_USER:-root}"
+          REMOTE_DIR="/tmp/${IMAGE_NAME}-${HERMES_GIT_REF}-incus"
+          ssh -i ~/.ssh/incus_key -o StrictHostKeyChecking=no "${SSH_USER}@${INCUS_HOST}" "rm -rf '${REMOTE_DIR}' && mkdir -p '${REMOTE_DIR}'"
+          scp -i ~/.ssh/incus_key -o StrictHostKeyChecking=no dist/incus/incus.tar.xz dist/incus/rootfs.squashfs "${SSH_USER}@${INCUS_HOST}:${REMOTE_DIR}/"
+          ssh -i ~/.ssh/incus_key -o StrictHostKeyChecking=no "${SSH_USER}@${INCUS_HOST}" \
+            "incus image alias delete '${IMAGE_NAME}' --project '${INCUS_PROJECT}' >/dev/null 2>&1 || true; \
+             incus image alias delete '${IMAGE_NAME}-${HERMES_GIT_REF}' --project '${INCUS_PROJECT}' >/dev/null 2>&1 || true; \
+             incus image import '${REMOTE_DIR}/incus.tar.xz' '${REMOTE_DIR}/rootfs.squashfs' --project '${INCUS_PROJECT}' --alias '${IMAGE_NAME}' --alias '${IMAGE_NAME}-${HERMES_GIT_REF}'; \
+             incus image list '${IMAGE_NAME}' --project '${INCUS_PROJECT}'; \
+             rm -rf '${REMOTE_DIR}'"
