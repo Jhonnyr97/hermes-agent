@@ -148,16 +148,21 @@ jobs:
           TPL
 
           cat >"${TEMPLATE_DIR}/user-data.tpl" <<'TPL'
-          {{ config_get("cloud-init.user-data", config_get("user.user-data", "#cloud-config\n")) }}
+          {{ config_get("cloud-init.user-data", config_get("user.user-data", "#cloud-config")) }}
           TPL
 
           cat >"${TEMPLATE_DIR}/vendor-data.tpl" <<'TPL'
-          {{ config_get("cloud-init.vendor-data", config_get("user.vendor-data", "#cloud-config\n")) }}
+          {{ config_get("cloud-init.vendor-data", config_get("user.vendor-data", "#cloud-config")) }}
           TPL
 
           cat >"${TEMPLATE_DIR}/network-config.tpl" <<'TPL'
-          {{ config_get("cloud-init.network-config", config_get("user.network-config", "version: 2\nethernets:\n  eth0:\n    dhcp4: true\n    dhcp6: false\n")) }}
+          {{ config_get("cloud-init.network-config", config_get("user.network-config", "{version: 2, ethernets: {eth0: {dhcp4: true, dhcp6: false}}}")) }}
           TPL
+
+          if grep -R '\\n' "${TEMPLATE_DIR}"; then
+            echo "Incus metadata templates must not contain literal \\\\n escapes." >&2
+            exit 2
+          fi
 
           cat >"${META_DIR}/metadata.yaml" <<YAML
           architecture: "${ARCHITECTURE}"
