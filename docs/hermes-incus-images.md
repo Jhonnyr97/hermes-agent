@@ -32,9 +32,9 @@ release=noble
 architecture=x86_64
 ```
 
-The builder script is `scripts/incus/build-hermes-image.sh`. It creates an
-Ubuntu rootfs, installs the Hermes runtime from this repository, writes
-safe placeholder config, and emits:
+The build is defined directly in the GitHub Actions workflow. It creates an
+Ubuntu rootfs, installs the Hermes runtime from this repository, writes safe
+placeholder config, adds Incus/cloud-init metadata templates, and emits:
 
 - `incus.tar.xz`
 - `rootfs.squashfs`
