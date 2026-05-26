@@ -1624,13 +1624,6 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             choices=function_args.get("choices"),
             callback=agent.clarify_callback,
         )
-    elif function_name == "clarify_web":
-        from tools.clarify_web_tool import clarify_web_tool as _clarify_web_tool
-        return _clarify_web_tool(
-            question=function_args.get("question", ""),
-            choices=function_args.get("choices"),
-            session_key=getattr(agent, "_gateway_session_key", "") or "",
-        )
     elif function_name == "delegate_task":
         return agent._dispatch_delegate_task(function_args)
     else:

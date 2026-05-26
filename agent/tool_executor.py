@@ -664,16 +664,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
-        elif function_name == "clarify_web":
-            from tools.clarify_web_tool import clarify_web_tool as _clarify_web_tool
-            function_result = _clarify_web_tool(
-                question=function_args.get("question", ""),
-                choices=function_args.get("choices"),
-                session_key=getattr(agent, "_gateway_session_key", "") or "",
-            )
-            tool_duration = time.time() - tool_start_time
-            if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('clarify_web', function_args, tool_duration, result=function_result)}")
         elif function_name == "delegate_task":
             tasks_arg = function_args.get("tasks")
             if tasks_arg and isinstance(tasks_arg, list):
