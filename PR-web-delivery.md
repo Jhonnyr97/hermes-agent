@@ -35,7 +35,7 @@ Fixes #
 
 <!-- List the specific changes. Include file paths for code changes. -->
 
-- `cron/scheduler.py`: add `"web"` to `_KNOWN_DELIVERY_PLATFORMS`, add `_deliver_web()` with optional auth (`HERMES_WEB_DELIVERY_TOKEN`) and config.yaml support (`cron.web_ui_url`), modify `_deliver_result()` to handle web before target resolution, fix dead-code guard to report errors
+- `cron/scheduler.py`: add `"web"` to `_KNOWN_DELIVERY_PLATFORMS`, add `_deliver_web()` with API server key auth and config.yaml support (`cron.web_ui_url`), modify `_deliver_result()` to handle web before target resolution, fix dead-code guard to report errors
 - `tools/cronjob_tools.py`: add `'web'` to valid deliver options in the `deliver` parameter description
 - `website/docs/user-guide/features/cron.md`: add `"web"` to the delivery options table
 
@@ -46,7 +46,7 @@ Fixes #
 1. Create a cron job with `deliver: "web"` via the API
 2. Verify the scheduler POSTs to `POST /api/cron_deliveries` with `{job_id, session_id, content}`
 3. Override the endpoint URL via `HERMES_WEB_UI_URL` env var or `cron.web_ui_url` in config.yaml
-4. Add auth via `HERMES_WEB_DELIVERY_TOKEN` env var (optional)
+4. Add auth via `API_SERVER_KEY`
 5. `python3 -m pytest tests/cron/test_scheduler.py::TestWebDelivery -v` (10 tests)
 
 ## Checklist

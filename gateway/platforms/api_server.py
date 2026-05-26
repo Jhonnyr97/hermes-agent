@@ -9,6 +9,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/models                  — lists hermes-agent as an available model
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
+- GET  /v1/skills                  — list installed skills available to API runs
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
@@ -1246,6 +1247,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "run_skills": True,
+                "skills_catalog": True,
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -1263,12 +1266,46 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
+                "skills": {"method": "GET", "path": "/v1/skills"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
             },
         })
+
+    async def _handle_skills(self, request: "web.Request") -> "web.Response":
+        """GET /v1/skills — return installed skills visible to API runs."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from tools.skills_tool import skills_list
+
+            raw = skills_list()
+            data = json.loads(raw)
+            if not data.get("success"):
+                return web.json_response(
+                    _openai_error(data.get("error") or "Failed to list skills"),
+                    status=500,
+                )
+
+            skills = data.get("skills") or []
+            return web.json_response({
+                "object": "list",
+                "data": skills,
+                "skills": skills,
+                "categories": data.get("categories") or [],
+                "count": data.get("count", len(skills)),
+                "updated_at": time.time(),
+            })
+        except Exception as exc:
+            logger.warning("[api_server] failed to list skills: %s", exc)
+            return web.json_response(
+                _openai_error("Failed to list skills"),
+                status=500,
+            )
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -3166,6 +3203,52 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return _callback
 
+    @staticmethod
+    def _normalize_run_skills(raw_skills: Any) -> tuple[List[str], Optional[str]]:
+        """Normalize the /v1/runs skills field into an ordered list of names."""
+        if raw_skills in (None, "", []):
+            return [], None
+        if isinstance(raw_skills, str):
+            items = [part.strip() for part in raw_skills.split(",")]
+        elif isinstance(raw_skills, list):
+            items = [str(part).strip() for part in raw_skills]
+        else:
+            return [], "'skills' must be a string or an array of strings"
+
+        skills: List[str] = []
+        seen: set[str] = set()
+        for item in items:
+            if not item or item in seen:
+                continue
+            skills.append(item)
+            seen.add(item)
+        return skills, None
+
+    def _build_run_skills_prompt(
+        self,
+        raw_skills: Any,
+        *,
+        task_id: str,
+    ) -> tuple[str, List[str], Optional[str]]:
+        """Load API-run skills using Hermes' native skill preloading path."""
+        skill_names, error = self._normalize_run_skills(raw_skills)
+        if error:
+            return "", [], error
+        if not skill_names:
+            return "", [], None
+
+        try:
+            from agent.skill_commands import build_preloaded_skills_prompt
+
+            prompt, _loaded, missing = build_preloaded_skills_prompt(
+                skill_names,
+                task_id=task_id,
+            )
+            return prompt, missing, None
+        except Exception as exc:
+            logger.warning("[api_server] failed to load run skills: %s", exc)
+            return "", [], "Failed to load skills"
+
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
         auth_err = self._check_auth(request)
@@ -3254,6 +3337,24 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
 
+        skills_prompt, missing_skills, invalid_skills_error = self._build_run_skills_prompt(
+            body.get("skills"),
+            task_id=session_id,
+        )
+        if invalid_skills_error:
+            return web.json_response(
+                _openai_error(invalid_skills_error, code="invalid_request_error", param="skills"),
+                status=400,
+            )
+        if missing_skills:
+            return web.json_response(
+                _openai_error(
+                    f"Unknown skill(s): {', '.join(missing_skills)}",
+                    code="invalid_request_error",
+                    param="skills",
+                ),
+                status=400,
+            )
         # Canonical pattern: load conversation history from SessionDB
         # when not provided by client. Mirrors gateway/run.py's
         # session_store.load_transcript() — no platform adapter builds
@@ -3274,6 +3375,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         approval_session_key = gateway_session_key or session_id or run_id
         ephemeral_system_prompt = instructions
+        if skills_prompt:
+            ephemeral_system_prompt = "\n\n".join(
+                part for part in (skills_prompt, ephemeral_system_prompt) if part
+            )
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
@@ -4574,6 +4679,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
+            self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
