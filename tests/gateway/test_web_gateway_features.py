@@ -53,6 +53,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
@@ -130,6 +131,10 @@ class TestSessionDBHistoryLoading:
                     },
                 )
                 assert resp.status == 202
+                for _ in range(20):
+                    if mock_agent.run_conversation.called:
+                        break
+                    await asyncio.sleep(0.01)
 
                 # Verify the agent was called with the loaded history
                 assert mock_agent.run_conversation.called
@@ -186,6 +191,83 @@ class TestSessionDBHistoryLoading:
                 _call_kwargs = mock_agent.run_conversation.call_args.kwargs
                 history_arg = _call_kwargs.get("conversation_history", [])
                 assert len(history_arg) == 0
+
+
+class TestAPIServerSkills:
+    @pytest.mark.asyncio
+    async def test_lists_skills_from_native_skills_tool(self, adapter):
+        app = _create_runs_app(adapter)
+        payload = {
+            "success": True,
+            "skills": [
+                {"name": "plan", "description": "Plan work", "category": "software-development"}
+            ],
+            "categories": ["software-development"],
+            "count": 1,
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.skills_tool.skills_list", return_value=json.dumps(payload)):
+                resp = await cli.get("/v1/skills")
+                body = await resp.json()
+
+        assert resp.status == 200
+        assert body["count"] == 1
+        assert body["skills"][0]["name"] == "plan"
+
+    @pytest.mark.asyncio
+    async def test_run_skills_are_loaded_into_ephemeral_prompt(self, adapter, mock_agent):
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_create_agent", return_value=mock_agent) as create_agent,
+                patch(
+                    "agent.skill_commands.build_preloaded_skills_prompt",
+                    return_value=("SKILL PROMPT", ["plan"], []),
+                ) as build_skills,
+            ):
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "Do it",
+                        "session_id": "web-session-1",
+                        "instructions": "BASE INSTRUCTIONS",
+                        "skills": ["plan"],
+                    },
+                )
+
+        assert resp.status == 202
+        build_skills.assert_called_once_with(["plan"], task_id="web-session-1")
+        prompt = create_agent.call_args.kwargs["ephemeral_system_prompt"]
+        assert "SKILL PROMPT" in prompt
+        assert "BASE INSTRUCTIONS" in prompt
+
+    @pytest.mark.asyncio
+    async def test_unknown_run_skill_rejects_request(self, adapter, mock_agent):
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_create_agent", return_value=mock_agent) as create_agent,
+                patch(
+                    "agent.skill_commands.build_preloaded_skills_prompt",
+                    return_value=("", [], ["missing-skill"]),
+                ),
+            ):
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "Do it",
+                        "session_id": "web-session-1",
+                        "skills": ["missing-skill"],
+                    },
+                )
+                body = await resp.json()
+
+        assert resp.status == 400
+        assert "Unknown skill" in body["error"]["message"]
+        create_agent.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_handles_empty_db_gracefully(self, adapter, mock_agent):
@@ -268,9 +350,8 @@ class TestSessionContextVars:
                 # Verify set_session_vars was called with correct args
                 mock_set_vars.assert_called_once()
                 _call_kwargs = mock_set_vars.call_args.kwargs
-                assert _call_kwargs["platform"] == "aziendaos"
-                assert "42" in str(_call_kwargs["chat_id"])
-                assert "aziendaos:42" in str(_call_kwargs["session_key"])
+                assert _call_kwargs["platform"] == "web"
+                assert _call_kwargs["session_key"] == "rails-session-42"
 
     @pytest.mark.asyncio
     async def test_does_not_set_context_for_non_rails_session(self, adapter, mock_agent):
@@ -288,7 +369,7 @@ class TestSessionContextVars:
                     },
                 )
                 assert resp.status == 202
-                mock_set_vars.assert_not_called()
+                mock_set_vars.assert_called_once_with(platform="web", session_key="telegram:12345")
 
     @pytest.mark.asyncio
     async def test_handles_malformed_rails_session_id(self, adapter, mock_agent):
@@ -307,9 +388,7 @@ class TestSessionContextVars:
                     },
                 )
                 assert resp.status == 202
-                # When chat_id is blank, set_session_vars should NOT be called
-                # (the code checks _chat_id before calling)
-                mock_set_vars.assert_not_called()
+                mock_set_vars.assert_called_once_with(platform="web", session_key="rails-session-")
 
 
 # ===========================================================================

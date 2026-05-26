@@ -638,9 +638,7 @@ def _deliver_web(job: dict, content: str) -> Optional[str]:
     which have sensible defaults for home channels, web delivery has
     no channel concept and no reasonable default URL.
 
-    Optional auth: set ``HERMES_WEB_DELIVERY_TOKEN`` env var to send
-    ``Authorization: Bearer *** with every POST.  When unset,
-    no auth header is sent.
+    Auth: sends ``Authorization: Bearer ***`` using ``API_SERVER_KEY``.
 
     Returns None on success, or an error string on failure.
     """
@@ -661,7 +659,7 @@ def _deliver_web(job: dict, content: str) -> Optional[str]:
             "in config.yaml or HERMES_WEB_UI_URL environment variable"
         )
 
-    delivery_token = os.getenv("HERMES_WEB_DELIVERY_TOKEN", "")
+    delivery_token = os.getenv("API_SERVER_KEY", "")
 
     # session_id is intentionally set to job["id"] — the web UI uses it as a
     # stable session key for the cron job.  Each execution POSTs to the same
