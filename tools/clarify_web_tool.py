@@ -1,7 +1,7 @@
-"""clarify_web tool — ask the user a question via the Web UI (Rails).
+"""clarify_web tool — ask the user a question via the Web UI.
 
 Works like the CLI ``clarify`` tool, but emits ``clarify.requested`` SSE events
-and blocks the agent thread until the user responds in the Rails UI.
+and blocks the agent thread until the user responds in the web UI.
 
 The CLI counterpart stays at ``tools/clarify_tool.py`` — both tools share the
 same schema shape but use different transport (CLI callback vs SSE + HTTP).
@@ -14,9 +14,10 @@ import json
 from typing import List, Optional
 
 from tools.clarify_gateway import (
-    get_clarify_notify,
-    set_current_session_key,
-    wait_for_clarify,
+    get_clarify_timeout,
+    get_notify,
+    register,
+    wait_for_response,
 )
 from tools.registry import registry
 
@@ -30,7 +31,7 @@ def clarify_web_tool(
     session_key: str = "",
     timeout: float = 300.0,
 ) -> str:
-    """Ask a clarifying question via the Rails Web UI.
+    """Ask a clarifying question via the Web UI.
 
     Args:
         question: The question to present.
@@ -68,25 +69,20 @@ def clarify_web_tool(
             ensure_ascii=False,
         )
 
-    # Set thread-local session key so the gateway module finds it.
-    token = set_current_session_key(session_key)
+    import uuid as _uuid
 
     try:
-        user_response = wait_for_clarify(
-            session_key=session_key,
-            question=question,
-            choices=choices,
-            timeout=timeout,
-        )
+        clarify_id = _uuid.uuid4().hex
+        entry = register(clarify_id, session_key, question, choices)
+        notify = get_notify(session_key)
+        if notify is not None:
+            notify(entry)
+        user_response = wait_for_response(clarify_id, timeout or get_clarify_timeout())
     except Exception as exc:
         return json.dumps(
             {"error": f"Failed to get user input: {exc}"},
             ensure_ascii=False,
         )
-    finally:
-        # Restore previous context var value
-        import contextvars as _cv
-        _cv.copy_context().run(lambda: None)
 
     return json.dumps({
         "question": question,
