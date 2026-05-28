@@ -3170,25 +3170,23 @@ def run_conversation(
                 else:
                     agent._vprint(f"{agent.log_prefix}🤖 Assistant: {assistant_message.content[:100]}{'...' if len(assistant_message.content) > 100 else ''}")
 
-            # Notify progress callback of model's thinking (used by subagent
-            # delegation to relay the child's reasoning to the parent display).
+            # Notify progress callback of model's thinking for subagent delegation.
+            #
+            # IMPORTANT: do NOT emit reasoning.available based on assistant_message.content.
+            # Many providers/models don't return structured reasoning, and using the
+            # assistant's *answer text* as "reasoning" makes downstream UIs unable to
+            # distinguish reasoning from the final response (it becomes identical or a
+            # 500-char prefix). Real reasoning should flow via `reasoning_callback` /
+            # `on_reasoning_delta` when available, or not at all.
             if (assistant_message.content and agent.tool_progress_callback):
                 _think_text = assistant_message.content.strip()
-                # Strip reasoning XML tags that shouldn't leak to parent display
                 _think_text = re.sub(
                     r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
                 ).strip()
-                # For subagents: relay first line to parent display (existing behaviour).
-                # For all agents with a structured callback: emit reasoning.available event.
                 first_line = _think_text.split('\n')[0][:80] if _think_text else ""
                 if first_line and getattr(agent, '_delegate_depth', 0) > 0:
                     try:
                         agent.tool_progress_callback("_thinking", first_line)
-                    except Exception:
-                        pass
-                elif _think_text:
-                    try:
-                        agent.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
                     except Exception:
                         pass
             
