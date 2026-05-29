@@ -2696,7 +2696,27 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {
+        "name",
+        "schedule",
+        "prompt",
+        "deliver",
+        "skills",
+        "skill",
+        "repeat",
+        "enabled",
+        # Per-job runtime overrides (supported by cron/jobs.py + hermes-ui)
+        "model",
+        "provider",
+        "base_url",
+        "enabled_toolsets",
+        "workdir",
+        "profile",
+        # Script/no-agent jobs + chaining
+        "script",
+        "no_agent",
+        "context_from",
+    }
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -2754,6 +2774,15 @@ class APIServerAdapter(BasePlatformAdapter):
             deliver = body.get("deliver", "local")
             skills = body.get("skills")
             repeat = body.get("repeat")
+            model = body.get("model")
+            provider = body.get("provider")
+            base_url = body.get("base_url")
+            enabled_toolsets = body.get("enabled_toolsets")
+            workdir = body.get("workdir")
+            profile = body.get("profile")
+            script = body.get("script")
+            context_from = body.get("context_from")
+            no_agent = body.get("no_agent")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -2781,11 +2810,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if model:
+                kwargs["model"] = model
+            if provider:
+                kwargs["provider"] = provider
+            if base_url:
+                kwargs["base_url"] = base_url
+            if enabled_toolsets:
+                kwargs["enabled_toolsets"] = enabled_toolsets
+            if workdir:
+                kwargs["workdir"] = workdir
+            if profile:
+                kwargs["profile"] = profile
+            if script:
+                kwargs["script"] = script
+            if context_from:
+                kwargs["context_from"] = context_from
+            if no_agent is not None:
+                kwargs["no_agent"] = bool(no_agent)
             if "origin" in body:
                 kwargs["origin"] = body["origin"]
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
@@ -2838,6 +2887,8 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
