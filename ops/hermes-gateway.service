@@ -2,6 +2,11 @@
 Description=Hermes Gateway
 After=network-online.target
 Wants=network-online.target
+# StartLimit* belong in [Unit], not [Service]. They tell systemd: if the unit
+# (re)starts more than Burst times within IntervalSec, stop trying — a clear
+# "this unit is broken" signal for operators instead of an infinite crashloop.
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -22,10 +27,6 @@ ExecStartPre=/opt/hermes-agent/ops/update-from-repo.sh
 ExecStart=/opt/hermes-agent/venv/bin/hermes gateway run
 Restart=always
 RestartSec=5
-# Don't keep restarting forever if ExecStartPre keeps failing — give the
-# operator a clear "this unit is broken" signal after a few quick retries.
-StartLimitIntervalSec=120
-StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target
