@@ -866,6 +866,19 @@ class TestDeliverResultErrorReturns:
         assert result is not None
         assert "no delivery target" in result
 
+    def test_web_delivery_authenticates_with_api_server_key(self, monkeypatch):
+        monkeypatch.setenv("API_SERVER_KEY", "env-api-key")
+        job = {"id": "web-job", "deliver": "web"}
+
+        with patch("cron.scheduler.load_config", return_value={"cron": {"web_ui_url": "http://ui.test"}}), \
+             patch("urllib.request.urlopen") as urlopen:
+            result = _deliver_result(job, "Output.")
+
+        assert result is None
+        request = urlopen.call_args.args[0]
+        assert request.headers["Authorization"] == "Bearer env-api-key"
+
+
 
 class TestRunJobSessionPersistence:
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
