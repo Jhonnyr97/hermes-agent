@@ -4693,8 +4693,13 @@ class APIServerAdapter(BasePlatformAdapter):
             "response": response,
         })
 
-    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
-        """GET /v1/sessions/{session_id} — read-only session metadata and messages.
+    async def _handle_get_session_v1(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id} — AziendaOS-flavoured session read
+        with compression chain resolution and rich include= options.
+
+        Coexists with upstream GET /api/sessions/{id}; kept because hermes-ui
+        depends on the resolved/compressed/lineage envelope and on
+        include=messages,tool_calls,reasoning,runtime for transcript views.
 
         Query params:
           resolved=true|false        default true  — follow parent→child chain
@@ -4945,8 +4950,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
 
-    async def _handle_create_session(self, request: "web.Request") -> "web.Response":
-        """POST /v1/sessions — create a new session with optional parent_session_id.
+    async def _handle_create_session_v1(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions — AziendaOS-flavoured session creation with
+        explicit session_id and optional parent_session_id for forking.
+
+        Coexists with upstream POST /api/sessions; kept because hermes-ui
+        passes a stable Rails-side session_id and relies on idempotent
+        creation, plus parent_session_id linkage at create time.
 
         Body:
           session_id (str, required) — the session identifier
@@ -5240,12 +5250,18 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
 
-            # AziendaOS extensions — endpoints with no upstream equivalent.
-            # /v1/runs/{id}/clarify/{cid}        web clarify response (UI flow)
-            # /v1/sessions/{id}/messages/replace bulk transcript replace
-            # /v1/files/read                     large-file inline read for UI preview
-            # /v1/files/{f}/download             HMAC-signed browser download
+            # AziendaOS extensions — endpoints with no upstream equivalent
+            # or whose response envelope hermes-ui depends on.
+            # /v1/runs/{id}/clarify/{cid}             web clarify response (UI flow)
+            # /v1/sessions                            create with explicit session_id + parent
+            # /v1/sessions/{id}                       resolved/compressed/lineage envelope
+            # /v1/sessions/{id}/messages/replace      bulk transcript replace (retry/undo)
+            # /v1/sessions/{id}/runtime               runtime metadata for the UI sidebar
+            # /v1/files/read                          large-file inline read for UI preview
+            # /v1/files/{f}/download                  HMAC-signed browser download
             self._app.router.add_post("/v1/runs/{run_id}/clarify/{clarify_id}", self._handle_clarify_response)
+            self._app.router.add_post("/v1/sessions", self._handle_create_session_v1)
+            self._app.router.add_get("/v1/sessions/{session_id}", self._handle_get_session_v1)
             self._app.router.add_get("/v1/sessions/{session_id}/runtime", self._handle_get_session_runtime)
             self._app.router.add_post(
                 "/v1/sessions/{session_id}/messages/replace",

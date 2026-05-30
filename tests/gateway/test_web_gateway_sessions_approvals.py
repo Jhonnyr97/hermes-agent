@@ -59,7 +59,7 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
-    app.router.add_get("/v1/sessions/{session_id}", adapter._handle_get_session)
+    app.router.add_get("/v1/sessions/{session_id}", adapter._handle_get_session_v1)
     app.router.add_get("/v1/sessions/{session_id}/runtime", adapter._handle_get_session_runtime)
     return app
 
