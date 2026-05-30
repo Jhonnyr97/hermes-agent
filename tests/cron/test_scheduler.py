@@ -2709,8 +2709,10 @@ class TestWebDelivery:
         assert result is None
         mock_urlopen.assert_called_once()
 
-    def test_deliver_result_sends_session_id_in_payload(self):
-        """The session_id from the resolved delivery target is sent in the JSON payload."""
+    def test_deliver_result_payload_carries_job_id_only(self):
+        """Multi-tenant model: payload carries only job_id + content. The UI
+        identifies the tenant from the API key and creates a fresh session
+        linked to job_id — no session_id is propagated from this side."""
         job = {
             "id": "web-session-job",
             "deliver": "web",
@@ -2721,11 +2723,11 @@ class TestWebDelivery:
             mock_urlopen.return_value = mock_response
             mock_urlopen.return_value.__enter__.return_value = mock_response
 
-            result = _deliver_result(job, "Check session_id")
+            result = _deliver_result(job, "Check payload shape")
 
         assert result is None
         req = mock_urlopen.call_args[0][0]
         payload = json.loads(req.data.decode("utf-8"))
         assert payload["job_id"] == "web-session-job"
-        assert payload["session_id"] == "1"
-        assert "Check session_id" in payload["content"]
+        assert "session_id" not in payload
+        assert "Check payload shape" in payload["content"]

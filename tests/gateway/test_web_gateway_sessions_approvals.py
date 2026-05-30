@@ -69,7 +69,7 @@ def _create_approval_app(adapter: APIServerAdapter) -> web.Application:
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
-    app.router.add_post("/v1/runs/{run_id}/approvals/{approval_id}", adapter._handle_run_approval)
+    app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     return app
 
 
@@ -378,7 +378,7 @@ class TestGetSessionRuntime:
 
 
 class TestRunApproval:
-    """Approval decision endpoint: once, session, always, deny."""
+    """Approval decision endpoint (upstream contract): choice + optional all."""
 
     @pytest.fixture
     def approval_adapter(self):
@@ -387,56 +387,55 @@ class TestRunApproval:
         adapter._run_approval_session_keys["run-1"] = "session-key-abc"
         adapter._run_approval_ids[("run-1", "approval-1")] = "session-key-abc"
         adapter._approval_session_map["approval-1"] = "session-key-abc"
+        adapter._run_statuses["run-1"] = {"run_id": "run-1", "status": "running"}
         return adapter
 
     @pytest.mark.asyncio
     async def test_auth_required(self, auth_adapter):
         """Without auth header, return 401."""
         auth_adapter._run_approval_session_keys["run-1"] = "session-key"
-        auth_adapter._run_approval_ids[("run-1", "approval-1")] = "session-key"
         app = _create_approval_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post("/v1/runs/run-1/approvals/approval-1", json={"decision": "once"})
+            resp = await cli.post("/v1/runs/run-1/approval", json={"choice": "once"})
             assert resp.status == 401
 
     @pytest.mark.asyncio
     async def test_auth_passes_with_valid_key(self, auth_adapter):
         """Valid Bearer token passes auth."""
         auth_adapter._run_approval_session_keys["run-1"] = "session-key"
-        auth_adapter._run_approval_ids[("run-1", "approval-1")] = "session-key"
+        auth_adapter._run_statuses["run-1"] = {"run_id": "run-1", "status": "running"}
         app = _create_approval_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch("tools.approval.has_blocking_approval", return_value=True), \
-                 patch("tools.approval.resolve_gateway_approval", return_value=1):
+            with patch("tools.approval.resolve_gateway_approval", return_value=1):
                 resp = await cli.post(
-                    "/v1/runs/run-1/approvals/approval-1",
-                    json={"decision": "once"},
+                    "/v1/runs/run-1/approval",
+                    json={"choice": "once"},
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 assert resp.status == 200
 
     @pytest.mark.asyncio
     async def test_unknown_run_returns_404(self, adapter):
-        """Run ID not in _run_approval_session_keys returns 404."""
+        """Run ID unknown to the adapter returns 404."""
         app = _create_approval_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
-                "/v1/runs/unknown-run/approvals/approval-1",
-                json={"decision": "once"},
+                "/v1/runs/unknown-run/approval",
+                json={"choice": "once"},
             )
             assert resp.status == 404
 
     @pytest.mark.asyncio
-    async def test_unknown_approval_returns_404(self, adapter):
-        """Approval ID not in _run_approval_ids returns 404."""
-        adapter._run_approval_session_keys["run-1"] = "session-key"
+    async def test_no_session_for_run_returns_409(self, adapter):
+        """Known run without an active approval session returns 409."""
+        adapter._run_statuses["run-1"] = {"run_id": "run-1", "status": "completed"}
         app = _create_approval_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
-                "/v1/runs/run-1/approvals/bogus-approval",
-                json={"decision": "once"},
+                "/v1/runs/run-1/approval",
+                json={"choice": "once"},
             )
-            assert resp.status == 404
+            assert resp.status == 409
 
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, approval_adapter):
@@ -444,20 +443,20 @@ class TestRunApproval:
         app = _create_approval_app(approval_adapter)
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
-                "/v1/runs/run-1/approvals/approval-1",
+                "/v1/runs/run-1/approval",
                 data=b"not json",
                 headers={"Content-Type": "application/json"},
             )
             assert resp.status == 400
 
     @pytest.mark.asyncio
-    async def test_invalid_decision_returns_400(self, approval_adapter):
-        """Decision value not in (once, session, always, deny) returns 400."""
+    async def test_invalid_choice_returns_400(self, approval_adapter):
+        """Choice value not in (once, session, always, deny) returns 400."""
         app = _create_approval_app(approval_adapter)
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
-                "/v1/runs/run-1/approvals/approval-1",
-                json={"decision": "maybe"},
+                "/v1/runs/run-1/approval",
+                json={"choice": "maybe"},
             )
             assert resp.status == 400
             body = await resp.json()
@@ -465,80 +464,96 @@ class TestRunApproval:
 
     @pytest.mark.asyncio
     async def test_no_pending_approval_returns_409(self, approval_adapter):
-        """When has_blocking_approval returns False, return 409."""
-        app = _create_approval_app(approval_adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch("tools.approval.has_blocking_approval", return_value=False):
-                resp = await cli.post(
-                    "/v1/runs/run-1/approvals/approval-1",
-                    json={"decision": "once"},
-                )
-                assert resp.status == 409
-
-    @pytest.mark.asyncio
-    async def test_resolve_returns_zero_returns_409(self, approval_adapter):
         """When resolve_gateway_approval returns 0, return 409."""
         app = _create_approval_app(approval_adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch("tools.approval.has_blocking_approval", return_value=True), \
-                 patch("tools.approval.resolve_gateway_approval", return_value=0):
+            with patch("tools.approval.resolve_gateway_approval", return_value=0):
                 resp = await cli.post(
-                    "/v1/runs/run-1/approvals/approval-1",
-                    json={"decision": "once"},
+                    "/v1/runs/run-1/approval",
+                    json={"choice": "once"},
+                )
+                assert resp.status == 409
+                body = await resp.json()
+                assert body["error"]["code"] == "approval_not_pending"
+
+    @pytest.mark.asyncio
+    async def test_resolve_returns_zero_returns_409(self, approval_adapter):
+        """Duplicate test guarding resolve→0 path explicitly."""
+        app = _create_approval_app(approval_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.approval.resolve_gateway_approval", return_value=0):
+                resp = await cli.post(
+                    "/v1/runs/run-1/approval",
+                    json={"choice": "once"},
                 )
                 assert resp.status == 409
 
-    @pytest.mark.parametrize("decision", ["once", "session", "always", "deny"])
+    @pytest.mark.parametrize("choice", ["once", "session", "always", "deny"])
     @pytest.mark.asyncio
-    async def test_all_valid_decisions_succeed(self, approval_adapter, decision):
-        """All four valid decisions return 200 with status=processed."""
+    async def test_all_valid_choices_succeed(self, approval_adapter, choice):
+        """All four valid choices return 200 with status=processed."""
         app = _create_approval_app(approval_adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch("tools.approval.has_blocking_approval", return_value=True), \
-                 patch("tools.approval.resolve_gateway_approval", return_value=1):
+            with patch("tools.approval.resolve_gateway_approval", return_value=1):
                 resp = await cli.post(
-                    "/v1/runs/run-1/approvals/approval-1",
-                    json={"decision": decision},
+                    "/v1/runs/run-1/approval",
+                    json={"choice": choice},
                 )
                 assert resp.status == 200
                 body = await resp.json()
                 assert body["status"] == "processed"
-                assert body["decision"] == decision
+                assert body["choice"] == choice
                 assert body["run_id"] == "run-1"
+                assert body["resolved_count"] == 1
 
     @pytest.mark.asyncio
-    async def test_cleans_up_mappings_after_success(self, approval_adapter):
-        """After successful approval, _run_approval_ids and _approval_session_map are cleaned."""
+    async def test_resolve_all_passes_through(self, approval_adapter):
+        """body.all=true is forwarded as resolve_all=True to the primitive."""
         app = _create_approval_app(approval_adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch("tools.approval.has_blocking_approval", return_value=True), \
-                 patch("tools.approval.resolve_gateway_approval", return_value=1):
+            with patch("tools.approval.resolve_gateway_approval", return_value=3) as mock_resolve:
                 resp = await cli.post(
-                    "/v1/runs/run-1/approvals/approval-1",
-                    json={"decision": "once"},
+                    "/v1/runs/run-1/approval",
+                    json={"choice": "session", "all": True},
                 )
                 assert resp.status == 200
-                assert ("run-1", "approval-1") not in approval_adapter._run_approval_ids
-                assert "approval-1" not in approval_adapter._approval_session_map
-                assert "run-1" in approval_adapter._run_approval_session_keys
+                mock_resolve.assert_called_once_with("session-key-abc", "session", resolve_all=True)
+                body = await resp.json()
+                assert body["resolved_count"] == 3
 
     @pytest.mark.asyncio
     async def test_cancels_expire_timer(self, approval_adapter):
-        """The auto-expire timer is cancelled when user responds."""
+        """The auto-expire timer for any approval on this run is cancelled."""
         timer = MagicMock()
         approval_adapter._approval_timeout_handles[("run-1", "approval-1")] = timer
 
         app = _create_approval_app(approval_adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch("tools.approval.has_blocking_approval", return_value=True), \
-                 patch("tools.approval.resolve_gateway_approval", return_value=1):
+            with patch("tools.approval.resolve_gateway_approval", return_value=1):
                 resp = await cli.post(
-                    "/v1/runs/run-1/approvals/approval-1",
-                    json={"decision": "once"},
+                    "/v1/runs/run-1/approval",
+                    json={"choice": "once"},
                 )
                 assert resp.status == 200
                 timer.cancel.assert_called_once()
                 assert ("run-1", "approval-1") not in approval_adapter._approval_timeout_handles
+
+    @pytest.mark.asyncio
+    async def test_cleans_up_mappings_after_success(self, approval_adapter):
+        """After successful approval, per-approval mappings on this run are cleaned."""
+        app = _create_approval_app(approval_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.approval.resolve_gateway_approval", return_value=1):
+                resp = await cli.post(
+                    "/v1/runs/run-1/approval",
+                    json={"choice": "once"},
+                )
+                assert resp.status == 200
+                assert ("run-1", "approval-1") not in approval_adapter._run_approval_ids
+                assert "approval-1" not in approval_adapter._approval_session_map
+                # The session_key mapping is retained so additional approvals
+                # on the same run remain routable.
+                assert "run-1" in approval_adapter._run_approval_session_keys
 
 
 # ===========================================================================
@@ -572,47 +587,14 @@ class TestCreateJob:
                 assert resp.status == 200
                 assert mock_create.called
 
-    @pytest.mark.asyncio
-    async def test_create_job_with_origin_passes_it_through(self, adapter):
-        """When origin is provided, it is forwarded to _cron_create."""
-        app = self._create_jobs_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch("gateway.platforms.api_server._cron_create", MagicMock(return_value={"id": "abc456"})) as mock_create:
-                resp = await cli.post("/api/jobs", json={
-                    "name": "web-job",
-                    "schedule": "every 10m",
-                    "prompt": "test",
-                    "deliver": "web",
-                    "origin": {"platform": "web", "chat_id": "42"},
-                })
-                assert resp.status == 200
-                mock_create.assert_called_once()
-                kwargs = mock_create.call_args.kwargs
-                assert kwargs.get("origin") == {"platform": "web", "chat_id": "42"}
-
-    @pytest.mark.asyncio
-    async def test_create_job_with_origin_but_without_deliver(self, adapter):
-        """Origin is optional — null origin is acceptable."""
-        app = self._create_jobs_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch("gateway.platforms.api_server._cron_create", MagicMock(return_value={"id": "abc789"})) as mock_create:
-                resp = await cli.post("/api/jobs", json={
-                    "name": "test",
-                    "schedule": "every 5m",
-                    "prompt": "test",
-                })
-                assert resp.status == 200
-                kwargs = mock_create.call_args.kwargs
-                assert kwargs.get("origin") is None
-
 
 # ===========================================================================
-# POST /api/jobs/{job_id}/run — trigger with deliver/origin overrides
+# POST /api/jobs/{job_id}/run — trigger with deliver override
 # ===========================================================================
 
 
 class TestTriggerJob:
-    """One-shot trigger with permanent deliver/origin overrides for web delivery."""
+    """One-shot trigger with optional deliver override for web delivery."""
 
     def _create_run_job_app(self, adapter):
         mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
@@ -647,20 +629,21 @@ class TestTriggerJob:
                 mock_trigger.assert_called_once_with("abc123def456")
 
     @pytest.mark.asyncio
-    async def test_trigger_job_with_origin_override(self, adapter):
-        """origin override calls update_job first, then trigger."""
+    async def test_trigger_job_ignores_origin_override(self, adapter):
+        """origin is no longer accepted as a body override (multi-tenant: the
+        worker derives delivery target from the job + API key)."""
         app = self._create_run_job_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch("gateway.platforms.api_server._cron_trigger", MagicMock(return_value={"id": "abc123def456"})) as mock_trigger, \
                  patch("gateway.platforms.api_server._cron_update", MagicMock(return_value={"id": "abc123def456"})) as mock_update:
                 resp = await cli.post("/api/jobs/abc123def456/run", json={"origin": {"platform": "web", "chat_id": "42"}})
                 assert resp.status == 200
-                mock_update.assert_called_once_with("abc123def456", {"origin": {"platform": "web", "chat_id": "42"}})
+                mock_update.assert_not_called()
                 mock_trigger.assert_called_once_with("abc123def456")
 
     @pytest.mark.asyncio
     async def test_trigger_job_with_both_overrides(self, adapter):
-        """Both deliver and origin overrides call update_job once, then trigger."""
+        """Both deliver and origin overrides — only deliver is persisted."""
         app = self._create_run_job_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch("gateway.platforms.api_server._cron_trigger", MagicMock(return_value={"id": "abc123def456"})) as mock_trigger, \
@@ -670,10 +653,7 @@ class TestTriggerJob:
                     "origin": {"platform": "web", "chat_id": "99"},
                 })
                 assert resp.status == 200
-                mock_update.assert_called_once_with("abc123def456", {
-                    "deliver": "web",
-                    "origin": {"platform": "web", "chat_id": "99"},
-                })
+                mock_update.assert_called_once_with("abc123def456", {"deliver": "web"})
                 mock_trigger.assert_called_once_with("abc123def456")
 
     @pytest.mark.asyncio

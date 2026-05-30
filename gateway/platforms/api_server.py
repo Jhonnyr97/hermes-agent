@@ -3422,7 +3422,13 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_run_job(self, request: "web.Request") -> "web.Response":
-        """POST /api/jobs/{job_id}/run — trigger immediate execution."""
+        """POST /api/jobs/{job_id}/run — trigger immediate execution.
+
+        AziendaOS extension: accept an optional `deliver` override in the
+        request body and persist it via _cron_update before triggering, so a
+        job created with `deliver=local` can be one-shot redirected to
+        `deliver=web` (and back) without losing its schedule.
+        """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -3432,7 +3438,17 @@ class APIServerAdapter(BasePlatformAdapter):
         job_id, id_err = self._check_job_id(request)
         if id_err:
             return id_err
+        overrides: Dict[str, Any] = {}
+        if request.can_read_body:
+            try:
+                body = await request.json()
+                if isinstance(body, dict) and "deliver" in body:
+                    overrides["deliver"] = body["deliver"]
+            except Exception:
+                pass
         try:
+            if overrides and _cron_update is not None:
+                _cron_update(job_id, overrides)
             job = _cron_trigger(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
@@ -3823,6 +3839,41 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("[api_server] SessionDB load failed for %s: %s", session_id, exc)
 
         ephemeral_system_prompt = instructions
+
+        # AziendaOS extension: preload skills into the ephemeral system prompt
+        # so callers (hermes-ui) can request a run with a specific skill set
+        # without having to assemble the skill prompt themselves. Unknown skill
+        # names return 400 so the UI surface stays consistent.
+        requested_skills = body.get("skills")
+        if requested_skills:
+            if not isinstance(requested_skills, list):
+                return web.json_response(
+                    _openai_error("'skills' must be an array of skill names"),
+                    status=400,
+                )
+            try:
+                from agent.skill_commands import build_preloaded_skills_prompt
+            except Exception:
+                build_preloaded_skills_prompt = None
+            if build_preloaded_skills_prompt is not None:
+                skill_prompt, _loaded, _unknown = build_preloaded_skills_prompt(
+                    list(requested_skills), task_id=session_id
+                )
+                if _unknown:
+                    return web.json_response(
+                        _openai_error(
+                            f"Unknown skill(s): {', '.join(_unknown)}",
+                            code="unknown_skill",
+                        ),
+                        status=400,
+                    )
+                if skill_prompt:
+                    ephemeral_system_prompt = (
+                        f"{ephemeral_system_prompt}\n\n{skill_prompt}"
+                        if ephemeral_system_prompt
+                        else skill_prompt
+                    )
+
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
@@ -4082,6 +4133,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                         "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                     }
+                    return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 # Check for structured failure (non-retryable client errors like
@@ -4449,34 +4501,41 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._clarify_session_map.pop(k[1], None)
 
     async def _handle_run_approval(self, request: "web.Request") -> "web.Response":
-        """POST /v1/runs/{run_id}/approvals/{approval_id} — decide on a pending approval.
+        """POST /v1/runs/{run_id}/approval — decide on the run's pending approval.
 
-        Body: {"decision": "once"|"session"|"always"|"deny"}
+        Body: {"choice": "once"|"session"|"always"|"deny", "all": bool}
 
-        Calls resolve_gateway_approval to unblock the waiting agent thread.
+        The route is singular (one in-flight approval per run at a time, per
+        upstream contract). Calls resolve_gateway_approval to unblock the
+        waiting agent thread.
         """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
         run_id = request.match_info["run_id"]
-        approval_id = request.match_info["approval_id"]
-
-        # Resolve session key from our mappings
-        session_key = self._run_approval_session_keys.get(run_id)
+        session_key = (
+            self._run_approval_session_keys.get(run_id)
+            or self._run_approval_sessions.get(run_id)
+        )
         if session_key is None:
+            # Distinguish unknown-run (404) from completed-run-no-pending (409):
+            # the latter is a normal client race where the agent finished while
+            # the user was still deciding.
+            if run_id not in self._run_statuses:
+                return web.json_response(
+                    _openai_error(
+                        f"Run not found: {run_id}",
+                        code="run_not_found",
+                    ),
+                    status=404,
+                )
             return web.json_response(
-                _openai_error(f"Run not found or no pending approvals: {run_id}",
-                              code="run_not_found"),
-                status=404,
-            )
-
-        # Validate the approval_id
-        if self._run_approval_ids.get((run_id, approval_id)) != session_key:
-            return web.json_response(
-                _openai_error(f"Approval not found: {approval_id}",
-                              code="approval_not_found"),
-                status=404,
+                _openai_error(
+                    "No pending approval for this run",
+                    code="approval_not_pending",
+                ),
+                status=409,
             )
 
         try:
@@ -4484,63 +4543,70 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
-        decision = body.get("decision", "").strip().lower()
-        if decision not in ("once", "session", "always", "deny"):
+        choice = str(body.get("choice", "")).strip().lower()
+        if choice not in ("once", "session", "always", "deny"):
             return web.json_response(
-                _openai_error(f"Invalid decision: {decision!r}. Must be one of: once, session, always, deny",
-                              code="invalid_decision"),
+                _openai_error(
+                    f"Invalid choice: {choice!r}. Must be one of: once, session, always, deny",
+                    code="invalid_choice",
+                ),
                 status=400,
             )
 
-        from tools.approval import resolve_gateway_approval, has_blocking_approval
+        # Body "all" accepts bool, "true"/"false", "1"/"0".
+        raw_all = body.get("all", False)
+        if isinstance(raw_all, str):
+            resolve_all = raw_all.strip().lower() in ("true", "1", "yes")
+        else:
+            resolve_all = bool(raw_all)
 
-        if not has_blocking_approval(session_key):
-            return web.json_response(
-                _openai_error("No pending approval for this session",
-                              code="no_pending_approval"),
-                status=409,
-            )
+        from tools.approval import resolve_gateway_approval
 
-        count = resolve_gateway_approval(session_key, decision)
+        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
         if not count:
             return web.json_response(
-                _openai_error("No pending command to approve",
-                              code="no_pending_approval"),
+                _openai_error(
+                    "No pending approval for this session",
+                    code="approval_not_pending",
+                ),
                 status=409,
             )
 
-        # Clean up our mapping (keep session_key for the run in case more approvals arrive)
-        self._run_approval_ids.pop((run_id, approval_id), None)
-        self._approval_session_map.pop(approval_id, None)
+        # Clean up per-approval mappings tied to this run; cancel any
+        # pending auto-expire timers so they don't fire after resolution.
+        for key in list(self._run_approval_ids.keys()):
+            if key[0] != run_id:
+                continue
+            timer_handle = self._approval_timeout_handles.pop(key, None)
+            if timer_handle is not None:
+                timer_handle.cancel()
+            self._run_approval_ids.pop(key, None)
+            self._approval_session_map.pop(key[1], None)
 
-        # Cancel the auto-expire timer since the user responded
-        timer_handle = self._approval_timeout_handles.pop((run_id, approval_id), None)
-        if timer_handle is not None:
-            timer_handle.cancel()
-
-        # Push approval.resolved SSE event so the client knows the outcome
+        # Push approval.resolved SSE event so the client knows the outcome.
         run_q = self._run_streams.get(run_id)
         if run_q is not None:
             try:
                 run_q.put_nowait({
                     "event": "approval.resolved",
                     "run_id": run_id,
-                    "approval_id": approval_id,
-                    "decision": decision,
-                    "expired": decision == "deny",
+                    "choice": choice,
+                    "resolved_count": count,
+                    "expired": choice == "deny",
                     "timestamp": time.time(),
                 })
             except Exception:
                 pass
 
         logger.info(
-            "[api_server] run %s approval %s: decision=%s",
-            run_id, approval_id, decision,
+            "[api_server] run %s approval choice=%s resolve_all=%s count=%d",
+            run_id, choice, resolve_all, count,
         )
         return web.json_response({
             "run_id": run_id,
             "status": "processed",
-            "decision": decision,
+            "choice": choice,
+            "resolved_count": count,
         })
 
     async def _handle_clarify_response(self, request: "web.Request") -> "web.Response":

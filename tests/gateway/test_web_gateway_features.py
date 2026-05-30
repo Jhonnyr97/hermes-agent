@@ -197,23 +197,21 @@ class TestAPIServerSkills:
     @pytest.mark.asyncio
     async def test_lists_skills_from_native_skills_tool(self, adapter):
         app = _create_runs_app(adapter)
-        payload = {
-            "success": True,
-            "skills": [
-                {"name": "plan", "description": "Plan work", "category": "software-development"}
-            ],
-            "categories": ["software-development"],
-            "count": 1,
-        }
+        skills = [
+            {"name": "plan", "description": "Plan work", "category": "software-development"},
+        ]
 
         async with TestClient(TestServer(app)) as cli:
-            with patch("tools.skills_tool.skills_list", return_value=json.dumps(payload)):
+            with (
+                patch("tools.skills_tool._find_all_skills", return_value=skills),
+                patch("tools.skills_tool._sort_skills", side_effect=lambda s: s),
+            ):
                 resp = await cli.get("/v1/skills")
                 body = await resp.json()
 
         assert resp.status == 200
-        assert body["count"] == 1
-        assert body["skills"][0]["name"] == "plan"
+        assert body["object"] == "list"
+        assert body["data"][0]["name"] == "plan"
 
     @pytest.mark.asyncio
     async def test_run_skills_are_loaded_into_ephemeral_prompt(self, adapter, mock_agent):
@@ -325,8 +323,18 @@ class TestAPIServerSkills:
 
 
 class TestSessionContextVars:
-    """When session_id starts with 'rails-session-', set_session_vars must
-    be called so tools (e.g. cronjob tool) can route deliveries back."""
+    """When session_id starts with 'rails-session-', the AziendaOS shim sets
+    contextvars with platform='aziendaos' so tools (e.g. cronjob tool) can
+    route deliveries back. Upstream's _run_sync additionally sets
+    platform='api_server' on every run — we only assert on our own call.
+    """
+
+    @staticmethod
+    def _aziendaos_calls(mock_set_vars):
+        return [
+            c for c in mock_set_vars.call_args_list
+            if c.kwargs.get("platform") == "aziendaos"
+        ]
 
     @pytest.mark.asyncio
     async def test_sets_context_for_rails_session(self, adapter, mock_agent):
@@ -347,11 +355,12 @@ class TestSessionContextVars:
                 )
                 assert resp.status == 202
 
-                # Verify set_session_vars was called with correct args
-                mock_set_vars.assert_called_once()
-                _call_kwargs = mock_set_vars.call_args.kwargs
-                assert _call_kwargs["platform"] == "web"
-                assert _call_kwargs["session_key"] == "rails-session-42"
+                calls = self._aziendaos_calls(mock_set_vars)
+                assert len(calls) == 1
+                _call_kwargs = calls[0].kwargs
+                assert _call_kwargs["platform"] == "aziendaos"
+                assert _call_kwargs["chat_id"] == "42"
+                assert _call_kwargs["session_key"] == "aziendaos:42"
 
     @pytest.mark.asyncio
     async def test_does_not_set_context_for_non_rails_session(self, adapter, mock_agent):
@@ -369,11 +378,12 @@ class TestSessionContextVars:
                     },
                 )
                 assert resp.status == 202
-                mock_set_vars.assert_called_once_with(platform="web", session_key="telegram:12345")
+                assert self._aziendaos_calls(mock_set_vars) == []
 
     @pytest.mark.asyncio
     async def test_handles_malformed_rails_session_id(self, adapter, mock_agent):
-        """rails-session- with empty ID should not crash."""
+        """rails-session- with empty ID should not crash and should not
+        trigger the AziendaOS context shim."""
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with (
@@ -388,7 +398,7 @@ class TestSessionContextVars:
                     },
                 )
                 assert resp.status == 202
-                mock_set_vars.assert_called_once_with(platform="web", session_key="rails-session-")
+                assert self._aziendaos_calls(mock_set_vars) == []
 
 
 # ===========================================================================

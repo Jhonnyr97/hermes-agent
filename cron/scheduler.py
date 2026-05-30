@@ -719,9 +719,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             )
             try:
                 import urllib.request, urllib.error
+                # Multi-tenant model: the API key identifies the tenant; the
+                # web UI creates a fresh session per delivery and links it to
+                # job_id. No session_id needs to be carried from this side.
                 payload = json.dumps({
                     "job_id": job["id"],
-                    "session_id": chat_id,
                     "content": content,
                 }).encode()
                 _headers = {"Content-Type": "application/json"}
