@@ -4039,8 +4039,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         unregister_gateway_notify,
                     )
                     from tools.clarify_gateway import (
-                        register_clarify_notify,
-                        unregister_clarify_notify,
+                        register_notify as register_clarify_notify,
+                        unregister_notify as unregister_clarify_notify,
                     )
 
                     effective_task_id = session_id or run_id
@@ -4579,7 +4579,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=404,
             )
 
-        from tools.clarify_gateway import resolve_clarify, has_pending_clarify
+        from tools.clarify_gateway import (
+            resolve_gateway_clarify,
+            has_pending as has_pending_clarify,
+        )
 
         if not has_pending_clarify(session_key):
             return web.json_response(
@@ -4588,7 +4591,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        resolved = resolve_clarify(session_key, response)
+        resolved = resolve_gateway_clarify(clarify_id, response)
         if not resolved:
             return web.json_response(
                 _openai_error("No pending clarify question to resolve",

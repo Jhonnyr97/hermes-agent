@@ -708,7 +708,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # create dynamic members via Platform._missing_().
         # Handle web delivery: POST directly to the web UI endpoint
         if platform_name.lower() == "web":
-            rails_url = os.getenv("HERMES_WEB_UI_URL", "http://hermes-ui:4000")
+            try:
+                _web_cfg = (load_config() or {}).get("cron", {}) or {}
+            except Exception:
+                _web_cfg = {}
+            rails_url = (
+                _web_cfg.get("web_ui_url")
+                or os.getenv("HERMES_WEB_UI_URL")
+                or "http://hermes-ui:4000"
+            )
             try:
                 import urllib.request, urllib.error
                 payload = json.dumps({
@@ -716,16 +724,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     "session_id": chat_id,
                     "content": content,
                 }).encode()
+                _headers = {"Content-Type": "application/json"}
+                _api_key = os.getenv("API_SERVER_KEY")
+                if _api_key:
+                    _headers["Authorization"] = f"Bearer {_api_key}"
                 req = urllib.request.Request(
                     f"{rails_url}/api/cron_deliveries",
                     data=payload,
-                    headers={"Content-Type": "application/json"},
+                    headers=_headers,
                     method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=15) as resp:
-                    if resp.status >= 400:
+                    _status = getattr(resp, "status", 200)
+                    if isinstance(_status, int) and _status >= 400:
                         raise urllib.error.HTTPError(
-                            resp.url, resp.status, resp.msg, resp.headers, None
+                            resp.url, _status, resp.msg, resp.headers, None
                         )
                 logger.info("Job '%s': delivered to web UI (session %s)", job["id"], chat_id)
             except urllib.error.HTTPError as e:
