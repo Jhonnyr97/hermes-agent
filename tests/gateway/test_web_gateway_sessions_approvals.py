@@ -353,22 +353,23 @@ class TestGetSessionRuntime:
                 patch("gateway.run._load_gateway_config", return_value=cfg),
                 patch("gateway.run._resolve_gateway_model", return_value="openrouter/auto"),
             ):
-                resp = await cli.get("/v1/sessions/test-session-42/runtime")
+                resp = await cli.get("/v1/sessions/test-session-42?include=runtime")
                 assert resp.status == 200
                 body = await resp.json()
 
-        assert body["object"] == "hermes.session.runtime"
-        assert body["id"] == "test-session-42"
-        assert body["runtime_controlled_by"] == "hermes"
-        assert body["advertised_model"] == "hermes-agent"
-        assert body["configured_model"] == "openrouter/auto"
-        assert body["configured_provider"] == "openrouter"
-        assert body["effective_model"] == "anthropic/claude-sonnet-4"
-        assert body["display_personality"] == "helpful"
-        assert body["configured_system_prompt"] == "global config prompt"
-        assert body["assembled_system_prompt"] == "assembled runtime prompt"
-        assert "config.agent.system_prompt" in body["prompt_sources"]
-        assert "runtime.assembled" in body["prompt_sources"]
+        runtime = body["runtime"]
+        assert runtime["object"] == "hermes.session.runtime"
+        assert runtime["id"] == "test-session-42"
+        assert runtime["runtime_controlled_by"] == "hermes"
+        assert runtime["advertised_model"] == "hermes-agent"
+        assert runtime["configured_model"] == "openrouter/auto"
+        assert runtime["configured_provider"] == "openrouter"
+        assert runtime["effective_model"] == "anthropic/claude-sonnet-4"
+        assert runtime["display_personality"] == "helpful"
+        assert runtime["configured_system_prompt"] == "global config prompt"
+        assert runtime["assembled_system_prompt"] == "assembled runtime prompt"
+        assert "config.agent.system_prompt" in runtime["prompt_sources"]
+        assert "runtime.assembled" in runtime["prompt_sources"]
 
 
 # ===========================================================================

@@ -234,12 +234,6 @@ TOOLSETS = {
         "includes": []
     },
 
-    "clarify_web": {
-        "description": "Ask the user clarifying questions via Web UI (Rails). Blocks until user responds in the browser.",
-        "tools": ["clarify_web"],
-        "includes": []
-    },
-
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
         "tools": ["execute_code"],
@@ -387,8 +381,8 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            # Clarifying questions via Web UI
-            "clarify_web",
+            # Clarifying questions
+            "clarify",
             # Planning & memory
             "todo", "memory",
             # Session history search
